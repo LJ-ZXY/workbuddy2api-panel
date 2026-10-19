@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1255,5 +1257,55 @@ func TestResponsesToChatDeepSeekInjectsAutonomousAgentRule(t *testing.T) {
 	contentNonDS := chatNonDS["messages"].([]any)[0].(map[string]any)["content"].(string)
 	if strings.Contains(contentNonDS, "AUTONOMOUS AGENT MODE") {
 		t.Fatal("injected rule for non-DeepSeek model")
+	}
+}
+
+func TestResponsesToChatCodexPromptNeutralization(t *testing.T) {
+	codexInstructions := `<h2>Intermediary updates</h2>
+<ul>
+<li>Intermediary updates go to the <code>commentary</code> channel.</li>
+<li>Before exploring or doing substantial work, you start with a user update acknowledging the request and explaining your first step.</li>
+</ul>
+<h2>Formatting rules</h2>
+<p>Keep code clean.</p>`
+
+	wireWithCodex := fmt.Sprintf(`{
+		"model": "cn:deepseek-v4.1-flash",
+		"tools": [{"type": "function", "name": "exec_command"}],
+		"input": [
+			{"role": "user", "content": %s},
+			{"role": "user", "content": "查一下服务器状态"}
+		]
+	}`, strconv.Quote(codexInstructions))
+
+	chatBytes, _, _, err := responsesToChat([]byte(wireWithCodex))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBytes, &chat); err != nil {
+		t.Fatal(err)
+	}
+	msgs := chat["messages"].([]any)
+	if len(msgs) < 3 {
+		t.Fatalf("expected at least 3 messages (system, user instructions, user prompt), got %d", len(msgs))
+	}
+
+	// 1. Verify Intermediary updates was replaced with execution override
+	firstUserMsg := msgs[1].(map[string]any)["content"].(string)
+	if strings.Contains(firstUserMsg, "Intermediary updates") {
+		t.Fatal("Intermediary updates was not neutralized")
+	}
+	if !strings.Contains(firstUserMsg, "[EXECUTION OVERRIDE FOR AUTONOMOUS AGENT MODE]") {
+		t.Fatal("missing EXECUTION OVERRIDE in neutralized prompt")
+	}
+	if !strings.Contains(firstUserMsg, "Formatting rules") {
+		t.Fatal("Formatting rules section was accidentally removed")
+	}
+
+	// 2. Verify last user message has tailExecutionReminder
+	lastUserMsg := msgs[len(msgs)-1].(map[string]any)["content"].(string)
+	if !strings.Contains(lastUserMsg, "[SYSTEM REMINDER: Do not reply with text intent") {
+		t.Fatal("missing tail execution reminder on last user message")
 	}
 }

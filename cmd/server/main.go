@@ -369,6 +369,9 @@ func main() {
 		Live:         live,
 		Usage:        rec,
 		RequestLog:   requestLog,
+		// 流诊断观察器（WB2A_STREAM_DIAGNOSTICS=1 时非 nil）。此前只创建不装配，
+		// 导致 sidecar-*.jsonl 自部署后零写入；responses/messages 两条协议共用。
+		StreamDiagnostics: streamDiagnostics,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的

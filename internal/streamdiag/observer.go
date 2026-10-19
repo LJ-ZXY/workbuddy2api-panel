@@ -56,6 +56,25 @@ var eventNames = [...]string{
 	"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
 	"response.function_call_arguments.delta", "response.function_call_arguments.done",
 	"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+	// Anthropic Messages 事件（/v1/messages）：与 Responses 共用同一套计数，
+	// 事件名本身即可区分协议，便于同一任务跨协议对比。
+	"message_start", "content_block_start", "content_block_delta", "content_block_stop",
+	"message_delta", "message_stop", "error",
+}
+
+// anthropicStopNames 是 message_delta.stop_reason 的封闭词表（其余归 other）。
+var anthropicStopNames = [...]string{"end_turn", "max_tokens", "tool_use", "refusal", "other"}
+
+// upstreamFinishNames 是上游 chat finish_reason 的封闭词表。
+var upstreamFinishNames = [...]string{"stop", "tool_calls", "function_call", "length", "max_tokens", "content_filter", "other"}
+
+func inList(v string, list []string) bool {
+	for _, s := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Metadata is the complete disk allowlist. No upstream ids, names, strings,
@@ -103,6 +122,12 @@ type Metadata struct {
 	AdapterShape           map[string]uint64 `json:"adapter_shape,omitempty"`
 	ToolNameFlow           map[string]uint64 `json:"tool_name_flow,omitempty"`
 	SSEFlow                map[string]uint64 `json:"sse_flow,omitempty"`
+	Protocol               string            `json:"protocol"`
+	UpstreamFinishReasons  map[string]uint64 `json:"upstream_finish_reasons,omitempty"`
+	StopReasons            map[string]uint64 `json:"stop_reasons,omitempty"`
+	ToolUseBlocks          uint64            `json:"tool_use_blocks,omitempty"`
+	TextBlocks             uint64            `json:"text_blocks,omitempty"`
+	ThinkingBlocks         uint64            `json:"thinking_blocks,omitempty"`
 }
 
 type itemState struct {
@@ -136,7 +161,9 @@ func validID(s, prefix string, n int) string {
 func GatewayID(s string) string { return validID(s, "dg_", 32) }
 
 func eligible(path, model string) bool {
-	if path != "/v1/responses" {
+	switch path {
+	case "/v1/responses", "/v1/messages", "/messages":
+	default:
 		return false
 	}
 	if model == "" || len(model) > 128 || strings.TrimSpace(model) != model {
@@ -150,16 +177,27 @@ func eligible(path, model string) bool {
 	return true
 }
 
+// protocolFor 把入站路径映射到封闭协议词表。
+func protocolFor(path string) string {
+	switch path {
+	case "/v1/messages", "/messages":
+		return "messages"
+	default:
+		return "responses"
+	}
+}
+
 func (r *Recorder) Begin(path, model, requestID, gatewayID string) *Observer {
 	if r == nil || !eligible(path, model) {
 		return nil
 	}
 	cleanModel := strings.TrimSpace(model)
 	return &Observer{rec: r, start: time.Now(), items: make(map[[32]byte]itemState), m: Metadata{
-		Schema: 4, Time: time.Now().UTC(), Path: "/v1/responses", Model: cleanModel,
+		Schema: 5, Time: time.Now().UTC(), Path: path, Protocol: protocolFor(path), Model: cleanModel,
 		RequestID: validID(requestID, "req-", 16), GatewayID: GatewayID(gatewayID),
 		FirstUpstreamMS: -1, FirstResponseMS: -1, LastResponseMS: -1,
 		EndReasons: map[string]uint64{}, ContinuationSkips: map[string]uint64{}, ResponseEvents: map[string]uint64{},
+		UpstreamFinishReasons: map[string]uint64{}, StopReasons: map[string]uint64{},
 	}}
 }
 
@@ -274,6 +312,27 @@ func (o *Observer) ContinuationAttempt() {
 	}
 }
 
+// UpstreamFinish 记录上游 chat 层的原始 finish_reason（归一后计数）。
+// 与 Segment/EndReasons 的区别：EndReasons 是续写层的分类结论，这里是上游原文，
+// 用于回答「Codex 提前收尾时上游到底给了什么」。
+func (o *Observer) UpstreamFinish(finish string) {
+	if o == nil {
+		return
+	}
+	if !inList(finish, upstreamFinishNames[:]) {
+		finish = "other"
+	}
+	o.m.UpstreamFinishReasons[finish]++
+}
+
+// anthropicStopReason 归一 Anthropic stop_reason。
+func anthropicStopReason(v string) string {
+	if !inList(v, anthropicStopNames[:]) {
+		return "other"
+	}
+	return v
+}
+
 // ClassifyEnd observes the original segment, before any synthetic terminals.
 func ClassifyEnd(finish string, done, readError, canceled, errorFrame, explicitLimit bool) EndReason {
 	switch {
@@ -327,6 +386,24 @@ func (o *Observer) Event(typ string, payload map[string]any, writeFailed bool) {
 		o.m.FirstResponseMS = ms
 	}
 	o.m.LastResponseMS = ms
+	// Anthropic Messages 事件：只读封闭枚举字段，正文/参数一律不碰。
+	switch typ {
+	case "content_block_start":
+		block, _ := payload["content_block"].(map[string]any)
+		switch block["type"] {
+		case "tool_use", "server_tool_use":
+			o.m.ToolUseBlocks++
+		case "text":
+			o.m.TextBlocks++
+		case "thinking":
+			o.m.ThinkingBlocks++
+		}
+	case "message_delta":
+		delta, _ := payload["delta"].(map[string]any)
+		if sr, ok := delta["stop_reason"].(string); ok && sr != "" {
+			o.m.StopReasons[anthropicStopReason(sr)]++
+		}
+	}
 	if typ == "response.completed" || typ == "response.incomplete" || typ == "response.failed" {
 		resp, _ := payload["response"].(map[string]any)
 		status, _ := resp["status"].(string)

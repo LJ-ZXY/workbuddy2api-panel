@@ -65,9 +65,15 @@ func TestDefaultOffAndExactFilter(t *testing.T) {
 			t.Fatal("ineligible model accepted")
 		}
 	}
-	for _, path := range []string{"/responses", "/v1/messages", "/v1/chat/completions", "/v1/responses/"} {
+	for _, path := range []string{"/responses", "/v1/chat/completions", "/v1/responses/"} {
 		if local.Begin(path, "glm-5.3", request, gateway) != nil {
 			t.Fatal("ineligible path accepted")
+		}
+	}
+	// Messages 协议与 Responses 同权：两条路径都产出同一套诊断，便于跨协议对比。
+	for _, path := range []string{"/v1/messages", "/messages"} {
+		if local.Begin(path, "glm-5.3", request, gateway) == nil {
+			t.Fatal("eligible messages path rejected")
 		}
 	}
 }
@@ -366,5 +372,68 @@ func TestJSONAndFilesystemFailureIsolation(t *testing.T) {
 	stats, _ := json.Marshal(r.Stats())
 	if strings.Contains(string(stats), "fake") || strings.Contains(string(stats), parent) {
 		t.Fatal("failure metadata leaked")
+	}
+}
+
+// Messages 协议与 Responses 同构：同一套观察器、同一份 schema，仅 protocol/path 不同。
+func TestMessagesObserverLifecycle(t *testing.T) {
+	r := newRecorder(t.TempDir())
+	o := r.Begin("/v1/messages", "deepseek-v4.1-flash", request, gateway)
+	if o == nil || o.m.Protocol != "messages" || o.m.Path != "/v1/messages" {
+		t.Fatalf("protocol/path = %q/%q", o.m.Protocol, o.m.Path)
+	}
+	o.UpstreamFrame()
+	o.UpstreamFinish("tool_calls")
+	o.UpstreamFinish("fake-free-text")
+	o.Event("message_start", map[string]any{"type": "message_start"}, false)
+	o.Event("content_block_start", map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{"type": "thinking", "thinking": "PRIVATE"},
+	}, false)
+	o.Event("content_block_start", map[string]any{
+		"type": "content_block_start", "index": 1,
+		"content_block": map[string]any{"type": "text", "text": "PRIVATE"},
+	}, false)
+	o.Event("content_block_start", map[string]any{
+		"type": "content_block_start", "index": 2,
+		"content_block": map[string]any{"type": "tool_use", "id": "PRIVATE", "name": "PRIVATE", "input": map[string]any{"secret": "PRIVATE"}},
+	}, false)
+	o.Event("message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "tool_use", "stop_sequence": nil},
+	}, false)
+	o.Event("message_stop", map[string]any{"type": "message_stop"}, false)
+	o.Event("content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": 2,
+		"delta": map[string]any{"type": "input_json_delta", "partial_json": `{"k":"PRIVATE"}`},
+	}, false)
+	m := o.m
+	if m.UpstreamFrames != 1 || m.UpstreamFinishReasons["tool_calls"] != 1 || m.UpstreamFinishReasons["other"] != 1 {
+		t.Fatalf("upstream finish reasons = %+v", m.UpstreamFinishReasons)
+	}
+	if m.StopReasons["tool_use"] != 1 || m.ToolUseBlocks != 1 || m.TextBlocks != 1 || m.ThinkingBlocks != 1 {
+		t.Fatalf("stop/blocks = %+v %d/%d/%d", m.StopReasons, m.ToolUseBlocks, m.TextBlocks, m.ThinkingBlocks)
+	}
+	if m.ResponseEvents["message_start"] != 1 || m.ResponseEvents["message_stop"] != 1 {
+		t.Fatalf("anthropic events not counted: %+v", m.ResponseEvents)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "PRIVATE") {
+		t.Fatal("messages diagnostics leaked payload text")
+	}
+}
+
+func TestAnthropicStopReasonVocabulary(t *testing.T) {
+	cases := map[string]string{
+		"end_turn": "end_turn", "max_tokens": "max_tokens", "tool_use": "tool_use",
+		"refusal": "refusal", "fake-free-text": "other", "": "other",
+	}
+	for in, want := range cases {
+		if got := anthropicStopReason(in); got != want {
+			t.Fatalf("anthropicStopReason(%q)=%q want %q", in, got, want)
+		}
 	}
 }

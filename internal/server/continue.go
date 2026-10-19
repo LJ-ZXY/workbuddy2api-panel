@@ -28,11 +28,13 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -74,18 +76,64 @@ type continueReader struct {
 	id       string
 
 	blindRetried bool // 断流盲重试已用（每请求一次；见 canContinue）
+	hasTools       bool // 请求体是否带可用工具
+	nudgeRetried   bool // 伪完成自动追问已用（每请求最多一次）
+	isPseudoFinish bool // 本次续写是否由动作承诺伪完成触发
 
 	lastClientAt time.Time // 上次客户端可见输出/keepalive 的时刻（静默节流）
 
 	usage map[string]any // 跨段累计 usage（数字叶子求和）
 	done  bool
+
+	diag *streamdiag.Observer // 流诊断（可选；nil = 零开销）
 }
 
 func newContinueReader(ctx context.Context, up *upstream.Client, acct *auth.Auth, body []byte, clientIP string, meta upstream.ChatMeta, rc io.ReadCloser) *continueReader {
-	r := &continueReader{ctx: ctx, up: up, acct: acct, body: body, clientIP: clientIP, meta: meta, cur: rc, lastClientAt: time.Now()}
+	r := &continueReader{ctx: ctx, up: up, acct: acct, body: body, clientIP: clientIP, meta: meta, cur: rc, lastClientAt: time.Now(),
+		diag: streamDiagnosticsFromCtx(ctx)}
 	r.br = bufio.NewReaderSize(rc, 64*1024)
 	r.limitSet = bodyHasOutputLimit(body)
+	r.hasTools = bodyHasTools(body)
 	return r
+}
+
+
+// bodyHasTools 请求体是否带有工具声明。
+func bodyHasTools(body []byte) bool {
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil {
+		return false
+	}
+	if tools, ok := obj["tools"].([]any); ok && len(tools) > 0 {
+		return true
+	}
+	if fns, ok := obj["functions"].([]any); ok && len(fns) > 0 {
+		return true
+	}
+	return false
+}
+
+var actionPromiseRegex = regexp.MustCompile(`(?i)(` +
+	`我再补|我先|接下来将|接下来进行|接下来|我来核验|我来检查|我来排查|我来修改|现在做|下面进行|准备执行|开始执行|马上进行|正在执行|` +
+	`i\s+will\s+now|i'll\s+now|next,?\s+i\s+will|let\s+me\s+now|let\s+me\s+check|i\s+am\s+going\s+to` +
+	`)`)
+
+var completionIndicators = regexp.MustCompile(`(?i)(已完成|全部完成|已全部完成|做完了|全部结束|无需进一步|所有测试均已通过|all tasks completed|finished successfully)`)
+
+func hasActionPromise(text string) bool {
+	t := strings.TrimSpace(text)
+	if len(t) == 0 {
+		return false
+	}
+	runes := []rune(t)
+	if len(runes) > 200 {
+		runes = runes[len(runes)-200:]
+	}
+	tail := string(runes)
+	if completionIndicators.MatchString(tail) {
+		return false
+	}
+	return actionPromiseRegex.MatchString(tail)
 }
 
 // bodyHasOutputLimit 请求体是否显式带输出限额（任一别名）。带限额 = 客户端有意
@@ -171,6 +219,9 @@ func (r *continueReader) frame(payload string) {
 	if id, ok := obj["id"].(string); ok && id != "" && r.id == "" {
 		r.id = id
 	}
+	if r.diag != nil {
+		r.diag.UpstreamFrame()
+	}
 	// usage 帧：消费入账（跨段合计），原始帧剥掉 usage 后再走常规路径——
 	// 避免 usage 双发（本层末尾会合成一条总计帧），同时兼容与 finish/delta
 	// 同帧的「bundled usage」形态（剥掉后内容照常透传）。
@@ -213,6 +264,9 @@ func (r *continueReader) frame(payload string) {
 			}
 			if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 				r.finish = fr
+				if r.diag != nil {
+					r.diag.UpstreamFinish(fr)
+				}
 			}
 		}
 	}
@@ -271,9 +325,17 @@ func (r *continueReader) endSegment(sawDone bool) {
 	if r.cur != nil {
 		r.cur.Close()
 	}
+	// 段终态观测：在续写决策之前分类，记录上游原始收尾形态（与续写结果解耦）。
+	// readError 恒为 false：本层不区分 io.EOF 与读错误，两者都按「无收尾」归类
+	// （EOFWithoutFinishDone），避免把正常 EOF 误报成读错误。
+	if r.diag != nil {
+		r.diag.Segment(streamdiag.ClassifyEnd(r.finish, sawDone, false,
+			r.ctx.Err() != nil, r.errSeen, r.limitSet), sawDone)
+	}
 	if r.canContinue(sawDone) {
 		// 必须是「断流盲重试」还是「length 截断续写」（r.finish 在续写成功后被重置）。
 		blind := !sawDone && r.finish == ""
+		isPseudo := r.isPseudoFinish
 		body, err := r.continuationBody()
 		if err == nil {
 			rc, status, _, terr := r.up.ChatStreamContext(r.ctx, r.acct, body, r.clientIP, r.meta, nil)
@@ -282,13 +344,24 @@ func (r *continueReader) endSegment(sawDone bool) {
 				if blind {
 					r.blindRetried = true
 				}
+				if isPseudo {
+					r.nudgeRetried = true
+					r.isPseudoFinish = false
+				}
+				if r.diag != nil {
+					r.diag.ContinuationAttempt()
+				}
 				r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
 				blindNote := ""
 				if blind {
 					blindNote = " (断流盲重试)"
 				}
-				log.Printf("[continue] seg=%d model=%s text=%dB reason=%dB%s -> 续写",
-					r.seg, bareModelOf(r.body), r.text.Len(), r.reason.Len(), blindNote)
+				pseudoNote := ""
+				if isPseudo {
+					pseudoNote = " (动作承诺伪完成自动追问)"
+				}
+				log.Printf("[continue] seg=%d model=%s text=%dB reason=%dB%s%s -> 续写",
+					r.seg, bareModelOf(r.body), r.text.Len(), r.reason.Len(), blindNote, pseudoNote)
 				r.finish, r.tail = "", nil
 				return
 			}
@@ -364,6 +437,40 @@ func (r *continueReader) emitTruncationTerminal() {
 // canContinue 续写资格判定（sawDone=false 表示 EOF/读错误收尾——只有显式
 // finish_reason=length 才续，读错误不续，避免把故障流当截断流续错）。
 func (r *continueReader) canContinue(sawDone bool) bool {
+	ok := r.canContinueDecision(sawDone)
+	if !ok && r.diag != nil {
+		r.diag.Skip(r.skipReason(sawDone))
+	}
+	return ok
+}
+
+// skipReason 与 canContinueDecision 的分支一一对应（仅在已判定不续时调用，供观测）。
+func (r *continueReader) skipReason(sawDone bool) streamdiag.SkipReason {
+	switch {
+	case r.seg >= maxContinueSegments-1:
+		return streamdiag.SegmentLimit
+	case r.errSeen:
+		return streamdiag.UpstreamError
+	case r.limitSet:
+		return streamdiag.ExplicitLimit
+	case r.cutNoFinish(sawDone):
+		if !(r.seg > 0 || r.text.Len() > 0 || r.reason.Len() > 0) {
+			return streamdiag.FirstSegmentEOF
+		}
+		if r.toolSeen {
+			return streamdiag.ToolFragment
+		}
+		return streamdiag.BlindRetryUsed
+	case r.finish != "length":
+		return streamdiag.NonLengthFinish
+	case r.toolSeen:
+		return streamdiag.ToolFragment
+	default:
+		return streamdiag.EmptyOutput
+	}
+}
+
+func (r *continueReader) canContinueDecision(sawDone bool) bool {
 	switch {
 	case r.seg >= maxContinueSegments-1:
 		return false
@@ -372,15 +479,13 @@ func (r *continueReader) canContinue(sawDone bool) bool {
 	case r.limitSet:
 		return false
 	case r.cutNoFinish(sawDone):
-		// 段无 finish 结束 = 上游偶发断流（线上实测：15 次续写里 1 次）。已产出内容时
-		// 允许一次盲重试：重试请求体把已收内容作为 assistant 前缀，幂等不重复。
-		// 主段同样给（此前只给 seg>0）——主段断流不是「请求本身失败」，它已经产出过
-		// 输出，把它交给截断终态正是「Codex 每次莫名中断、要手动继续」的主因（线上
-		// 实测 2 天内 27 次）。零输出段不给：没有可续的东西，且
-		// 客户端已断连时 ctx 已取消、重试发不出去，不会白烧额度。
-		// 含工具分片同样不给（与下面 length 分支同一条理由）：残缺 tool_calls 不进
-		// 重试前缀，模型会重发一遍，客户端在同一块里拼两次参数 → 半截 JSON 变垃圾。
 		return (r.seg > 0 || r.text.Len() > 0 || r.reason.Len() > 0) && !r.toolSeen && !r.blindRetried
+	case r.finish == "stop":
+		if r.hasTools && !r.toolSeen && !r.nudgeRetried && hasActionPromise(r.text.String()) {
+			r.isPseudoFinish = true
+			return true
+		}
+		return false
 	case r.finish != "length":
 		return false
 	case r.toolSeen:
@@ -410,7 +515,11 @@ func (r *continueReader) continuationBody() ([]byte, error) {
 	if rc := r.reason.String(); rc != "" {
 		asst["reasoning_content"] = rc
 	}
-	msgs = append(msgs, asst, map[string]any{"role": "user", "content": continueNudge})
+	nudge := continueNudge
+	if r.isPseudoFinish {
+		nudge = "请立即调用对应的工具执行上述操作，不要仅输出文字计划或总结。"
+	}
+	msgs = append(msgs, asst, map[string]any{"role": "user", "content": nudge})
 	obj["messages"] = msgs
 	return json.Marshal(obj)
 }

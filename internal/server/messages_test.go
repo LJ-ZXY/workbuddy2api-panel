@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -593,4 +596,71 @@ func TestAnthropicToolResultImagesMoveToUserMessage(t *testing.T) {
 	if len(m) != 3 || asString(m[2].(map[string]any)["role"]) != "user" {
 		t.Fatalf("msgs=%#v", m)
 	}
+}
+
+// Messages 协议接入流诊断后，转发字节必须与未接线时完全一致（观测层零副作用）。
+func TestMessagesDiagnosticsObserveWithoutChangingWire(t *testing.T) {
+	dir := t.TempDir()
+	rec := streamdiag.New(dir)
+	t.Cleanup(rec.Close)
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	body := `{"model":"deepseek-v4.1-flash","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}`
+
+	off := httptest.NewRecorder()
+	NewHandler(Config{Pool: p, Upstream: up}).ServeHTTP(off,
+		httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+
+	on := httptest.NewRecorder()
+	NewHandler(Config{Pool: p, Upstream: up, StreamDiagnostics: rec}).ServeHTTP(on,
+		httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+
+	if off.Code != on.Code || off.Body.String() != on.Body.String() {
+		t.Fatalf("diagnostics changed wire output:\n off=%s\n on =%s", off.Body.String(), on.Body.String())
+	}
+	rec.Close()
+	metas := readDiagnostics(t, dir)
+	if len(metas) != 1 {
+		t.Fatalf("diagnostics records = %d", len(metas))
+	}
+	meta := metas[0]
+	if meta.Protocol != "messages" || meta.Path != "/v1/messages" {
+		t.Fatalf("protocol/path = %q/%q", meta.Protocol, meta.Path)
+	}
+	if meta.ResponseEvents["message_start"] != 1 || meta.ResponseEvents["message_stop"] != 1 {
+		t.Fatalf("events = %+v", meta.ResponseEvents)
+	}
+	if meta.UpstreamFinishReasons["stop"] != 1 {
+		t.Fatalf("upstream finish = %+v", meta.UpstreamFinishReasons)
+	}
+	if meta.StopReasons["end_turn"] != 1 {
+		t.Fatalf("stop reasons = %+v", meta.StopReasons)
+	}
+}
+
+// readDiagnostics 读取临时目录下的 sidecar JSONL 归档（测试专用）。
+func readDiagnostics(t *testing.T, dir string) []streamdiag.Metadata {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "sidecar-stream-*.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []streamdiag.Metadata
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			if line == "" {
+				continue
+			}
+			var m streamdiag.Metadata
+			if err := json.Unmarshal([]byte(line), &m); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, m)
+		}
+	}
+	return out
 }

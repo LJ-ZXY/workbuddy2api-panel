@@ -9,12 +9,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 )
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -53,13 +55,32 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(chat, &peek)
-	r2 := r.Clone(r.Context())
+	// 流诊断（与 responses.go 同构）：Messages 与 Responses 产出同一套计数，
+	// 便于同一任务跨协议对比「上游 finish_reason / 工具调用 / 续写决策」。
+	var diag *streamdiag.Observer
+	if peek.Stream && h.cfg.StreamDiagnostics != nil {
+		requestID, gatewayID := "", ""
+		if tr := requestTraceFrom(r); tr != nil {
+			requestID = tr.id
+		}
+		if ids := r.Header.Values("X-CodeBuddy-Diagnostic-ID"); len(ids) == 1 {
+			gatewayID = ids[0]
+		}
+		diag = h.cfg.StreamDiagnostics.Begin(r.URL.Path, peek.Model, requestID, gatewayID)
+	}
+	defer func() { diag.Complete(r.Context().Err() != nil) }()
+	ctx := r.Context()
+	if diag != nil {
+		ctx = context.WithValue(ctx, streamDiagnosticsKey{}, diag)
+	}
+	r2 := r.Clone(ctx)
 	r2.Body = io.NopCloser(bytes.NewReader(chat))
 	r2.ContentLength = int64(len(chat))
-	rw := &messagesWriter{ResponseWriter: w, stream: peek.Stream, prelude: prelude}
+	rw := &messagesWriter{ResponseWriter: w, stream: peek.Stream, prelude: prelude, diag: diag}
 	defer rw.finish()
 	h.chatCompletions(rw, r2)
 }
@@ -707,6 +728,8 @@ type messagesWriter struct {
 	// 只能在 message_start 之后、正文之前落地，且占用正文之前的内容块下标。
 	prelude []any
 	x       anthState
+	// diag 流诊断观察器（可选；nil = 零开销）。与 responsesWriter 同构。
+	diag *streamdiag.Observer
 }
 
 type anthState struct {
@@ -1136,6 +1159,11 @@ func (w *messagesWriter) emit(event string, payload map[string]any) error {
 		payload = map[string]any{}
 	}
 	payload["type"] = event
+	// 观测点：只传已组装好的结构化字段，观察器只读封闭枚举（type / content_block.type /
+	// delta.stop_reason），绝不落正文。
+	if w.diag != nil {
+		w.diag.Event(event, payload, false)
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err

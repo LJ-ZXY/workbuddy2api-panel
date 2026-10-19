@@ -31,6 +31,15 @@ func streamDiagnosticsFrom(r *http.Request) *streamdiag.Observer {
 	return o
 }
 
+// streamDiagnosticsFromCtx 供 continueReader 等只持有 context 的层取观察器。
+func streamDiagnosticsFromCtx(ctx context.Context) *streamdiag.Observer {
+	if ctx == nil {
+		return nil
+	}
+	o, _ := ctx.Value(streamDiagnosticsKey{}).(*streamdiag.Observer)
+	return o
+}
+
 const autonomousAgentRule = "\n\n[CRITICAL EXECUTION RULE FOR AUTONOMOUS AGENT MODE]\n" +
 	"You are executing in a non-interactive autonomous agent tool-calling loop.\n" +
 	"1. NEVER emit text stating intent to perform further checks, edits, reads, or verifications (e.g., \"我先...\", \"现在做...\", \"我补上...\", \"接下来将...\") without invoking the corresponding tool in the EXACT SAME TURN.\n" +
@@ -90,6 +99,73 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream, meta: meta, diag: diag, trace: requestTraceFrom(r), ctx: r.Context()}
 	defer rw.finish()
 	h.chatCompletions(rw, r2)
+}
+
+
+const intermediaryOverride = "<h2>Execution Mode</h2>\n" +
+	"<p>[EXECUTION OVERRIDE FOR AUTONOMOUS AGENT MODE]\n" +
+	"Intermediary progress updates are strictly DISABLED. You MUST NOT emit text planning, progress commentary, or intent before executing. If any exploration, file edit, or action is required, you MUST invoke the corresponding tool directly in this exact turn without conversational preamble.</p>"
+
+const tailExecutionReminder = "\n\n[SYSTEM REMINDER: Do not reply with text intent, explanations, or progress updates before acting. If action is needed, invoke the tool call directly.]"
+
+func cleanIntermediaryUpdates(text string) string {
+	idx := strings.Index(text, "Intermediary updates")
+	if idx < 0 {
+		return text
+	}
+	start := idx
+	if h2 := strings.LastIndex(text[:idx], "<h2"); h2 >= 0 && idx-h2 < 30 {
+		start = h2
+	} else if md := strings.LastIndex(text[:idx], "###"); md >= 0 && idx-md < 10 {
+		start = md
+	} else if hash := strings.LastIndex(text[:idx], "#"); hash >= 0 && idx-hash < 10 {
+		start = hash
+	}
+	end := len(text)
+	if ulEnd := strings.Index(text[idx:], "</ul>"); ulEnd >= 0 {
+		end = idx + ulEnd + len("</ul>")
+	} else if nextH := strings.Index(text[idx:], "\n\n"); nextH >= 0 {
+		end = idx + nextH
+	}
+	return text[:start] + intermediaryOverride + text[end:]
+}
+
+func cleanDeepSeekCodexMessages(msgs []any) {
+	var lastUserMsg map[string]any
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if c, ok := m["content"].(string); ok {
+			if strings.Contains(c, "Intermediary updates") {
+				m["content"] = cleanIntermediaryUpdates(c)
+			}
+		} else if parts, ok := m["content"].([]any); ok {
+			for _, p := range parts {
+				pm, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				if t, ok := pm["text"].(string); ok && strings.Contains(t, "Intermediary updates") {
+					pm["text"] = cleanIntermediaryUpdates(t)
+				}
+			}
+		}
+		if m["role"] == "user" {
+			lastUserMsg = m
+		}
+	}
+	if lastUserMsg != nil {
+		if c, ok := lastUserMsg["content"].(string); ok {
+			lastUserMsg["content"] = c + tailExecutionReminder
+		} else if parts, ok := lastUserMsg["content"].([]any); ok {
+			lastUserMsg["content"] = append(parts, map[string]any{
+				"type": "text",
+				"text": tailExecutionReminder,
+			})
+		}
+	}
 }
 
 func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, error) {
@@ -152,6 +228,9 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 		}
 	case []any:
 		msgs = append(msgs, convertInputItems(in, meta)...)
+	}
+	if strings.Contains(strings.ToLower(modelStr), "deepseek") && out["tools"] != nil {
+		cleanDeepSeekCodexMessages(msgs)
 	}
 	out["messages"] = msgs
 	b, err := json.Marshal(out)

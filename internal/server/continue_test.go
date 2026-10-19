@@ -660,3 +660,79 @@ func TestContinueReaderSeg2StreamCutBlindRetry(t *testing.T) {
 		t.Fatalf("续写成功后 length 终态不应外泄:\n%s", s)
 	}
 }
+
+func TestHasActionPromise(t *testing.T) {
+	// Should match action promises
+	casesTrue := []string{
+		"线上已确认运行 `v8.0.32`，而官方稳定版已发布 `v8.0.33`（2026-10-18 21:06 北京时间）。我再补一项实时接口的版本头与容器状态核验，然后给出结论。",
+		"现在做最终一致性复核：",
+		"接下来将对代码进行修改",
+		"我先查看日志",
+		"我来检查一下网络连接",
+		"准备执行部署命令",
+		"I will now check the server status",
+		"Let me now verify the files",
+	}
+	for _, s := range casesTrue {
+		if !hasActionPromise(s) {
+			t.Errorf("hasActionPromise(%q) want true, got false", s)
+		}
+	}
+
+	// Should not match normal answers or completed statements
+	casesFalse := []string{
+		"所有测试均已通过，修改已全部完成。",
+		"北京今天天气晴朗，气温20度。",
+		"999朵玫瑰寓意天长地久。",
+		"代码已修改完毕，已全部完成。",
+		"All tasks completed successfully.",
+		"",
+	}
+	for _, s := range casesFalse {
+		if hasActionPromise(s) {
+			t.Errorf("hasActionPromise(%q) want false, got true", s)
+		}
+	}
+}
+
+func TestContinueReaderPseudoFinishAutoNudge(t *testing.T) {
+	// 段 1: 模型输出了计划承诺，随后因 finish_reason: stop 结束且无工具
+	seg1PseudoFinish := `data: {"id":"cmpl-1","choices":[{"index":0,"delta":{"content":"我再补一项核验，然后给出结论。"}}],"usage":{"prompt_tokens":10,"completion_tokens":15,"total_tokens":25}}` + "\n\n" +
+		`data: {"id":"cmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	// 段 2: 追问后模型正常调用工具收尾
+	seg2ToolCall := `data: {"id":"cmpl-2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"uptime\"}"}}]}}]}` + "\n\n" +
+		`data: {"id":"cmpl-2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":30,"completion_tokens":20,"total_tokens":50}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	up, reqs := fakeContinueUpstream(t, func(call int) (int, string) {
+		return 200, seg2ToolCall
+	})
+
+	body := `{"model":"deepseek-v4.1-flash","tools":[{"type":"function","name":"exec_command"}],"messages":[{"role":"user","content":"check status"}]}`
+	r := newTestContinueReader(t, up, body, io.NopCloser(strings.NewReader(seg1PseudoFinish)))
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(out)
+
+	if len(*reqs) != 1 {
+		t.Fatalf("伪完成应触发 1 次追问续写，实际 %d 次", len(*reqs))
+	}
+	nudgeReq := (*reqs)[0]
+	if !strings.Contains(nudgeReq, "请立即调用对应的工具执行上述操作") {
+		t.Fatalf("续写请求体缺少伪完成自动追问 prompt:\n%s", nudgeReq)
+	}
+	if !strings.Contains(s, "我再补一项核验") {
+		t.Fatalf("客户端可见流应保留段 1 文本:\n%s", s)
+	}
+	if !strings.Contains(s, "exec_command") {
+		t.Fatalf("客户端可见流应收到段 2 续写产生的工具调用:\n%s", s)
+	}
+	if !strings.Contains(s, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("最终终态应为 tool_calls:\n%s", s)
+	}
+}
