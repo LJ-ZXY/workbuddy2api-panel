@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -61,6 +62,8 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	StreamDiagnostics *streamdiag.Recorder
 
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	Usage *usage.Recorder
@@ -1460,7 +1463,7 @@ func validUsageCredit(credit float64, present bool) bool {
 
 // parseUsageTotalTokens 只接受落在 int 范围的有限正整数（小数/越界/NaN 一律拒绝）。
 func parseUsageTotalTokens(total float64) (int, bool) {
-	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total || total >= math.Exp2(63) {
 		return 0, false
 	}
 	parsed := int(total)

@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -13,8 +14,9 @@ import (
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
+	mu          sync.RWMutex
+	byUID       map[string]*entry
+	removedUIDs map[string]bool
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
@@ -394,6 +396,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	delete(p.removedUIDs, a.UID)
 	p.upsertLocked(a)
 }
 
@@ -404,6 +407,9 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	defer p.mu.Unlock()
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
+		if p.removedUIDs[a.UID] {
+			continue
+		}
 		seen[a.UID] = true
 		p.upsertLocked(a)
 	}
@@ -435,10 +441,40 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	return e.a
 }
 
+// RemoveCredential removes only the credential object selected by the caller.
+func (p *Pool) RemoveCredential(uid string, expected *auth.Auth) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.a != expected {
+		return fmt.Errorf("account changed or no longer registered")
+	}
+	delete(p.byUID, uid)
+	if !p.saveLocked() {
+		p.byUID[uid] = e
+		p.dirty.Store(true)
+		return fmt.Errorf("account removal persistence failed")
+	}
+	if err := e.a.RemoveCredentialFile(); err != nil {
+		p.byUID[uid] = e
+		if !p.saveLocked() {
+			p.dirty.Store(true)
+			return fmt.Errorf("credential deletion failed; account restored in memory but state restore failed: %w", err)
+		}
+		return fmt.Errorf("credential deletion failed; account retained: %w", err)
+	}
+	if p.removedUIDs == nil {
+		p.removedUIDs = make(map[string]bool)
+	}
+	p.removedUIDs[uid] = true
+	return nil
+}
+
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	if e, ok := p.byUID[a.UID]; ok {
+		a.ShareCredentialLifecycle(e.a)
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}

@@ -46,3 +46,4 @@ docs/
 /cmd/desktopverify*/
 *.zip
 server.exe
+build/

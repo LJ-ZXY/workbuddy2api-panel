@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/accountmodels"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
@@ -36,6 +37,7 @@ import (
 
 // Config 面板依赖（main 装配注入）。
 type Config struct {
+	StateFile string
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
@@ -78,7 +80,10 @@ type Config struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
+	accountModels *accountmodels.Store
+	modelRejectMu sync.Mutex
+	modelRejected map[accountmodels.Identity][32]byte
+	cfg           Config
 	mux     *http.ServeMux
 	started time.Time
 	logs    *Ring
@@ -159,7 +164,8 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
+		accountModels: accountmodels.New(accountmodels.PathForState(cfg.StateFile)),
+		cfg:           cfg,
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
@@ -182,6 +188,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/models", p.withAuth(p.accountModelSnapshot))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/models/refresh", p.withAuth(p.accountModelRefresh))
+	p.mux.HandleFunc("POST /panel/api/models/refresh", p.withAuth(p.accountModelsRefresh))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/refresh", p.withAuth(p.accountRefresh))
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/download", p.withAuth(p.accountDownload))
+	p.mux.HandleFunc("PATCH /panel/api/accounts/{uid}/status", p.withAuth(p.accountSetStatus))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -282,8 +294,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+	observedAt := time.Now().Format(time.RFC3339)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
+		"observed_at":               observedAt,
+		"model_cooldowns_supported": true,
+		"auth_files_supported":      true,
+		"version":                   p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
 		"redis_mode":      p.cfg.RedisMode,
@@ -854,20 +870,19 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
+	if !p.tryLockAccount(uid) {
+		writeErr(w, http.StatusConflict, "account operation in progress")
+		return
+	}
+	defer p.unlockAccount(uid)
+	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	fileMsg := ""
-	if a.FilePath != "" {
-		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
-			fileMsg = err.Error()
-		}
-	}
-	if fileMsg != "" {
-		log.Printf("panel: remove uid=%s（auth 文件删除失败: %s）", uid, fileMsg)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
+	if err := p.cfg.Pool.RemoveCredential(uid, a); err != nil {
+		log.Printf("panel: remove uid=%s: %v", uid, err)
+		writeErr(w, http.StatusInternalServerError, "account removal failed; account retained in memory; file or state persistence may be incomplete")
 		return
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)

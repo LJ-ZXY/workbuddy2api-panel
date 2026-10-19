@@ -31,6 +31,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
@@ -275,6 +276,9 @@ func main() {
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
+	streamDiagnostics := streamdiag.NewFromEnv()
+	defer streamDiagnostics.Close()
+
 	requestLog := reqlog.New(reqlog.Config{
 		Dir:           stateSibling(cfg.StateFile, "request-logs"),
 		Enabled:       cfg.Logging.RequestArchiveEnabled,
@@ -304,6 +308,7 @@ func main() {
 
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
+			StateFile: cfg.StateFile,
 		Pool:       p,
 		Usage:      rec,
 		RequestLog: requestLog,

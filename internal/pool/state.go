@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"sort"
@@ -13,6 +14,25 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
+
+// SetDisabled changes only the explicit enable flag.
+func (p *Pool) SetDisabled(uid string, disabled bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return fmt.Errorf("account not found")
+	}
+	previous := e.disabled
+	e.disabled = disabled
+	if !p.saveLocked() {
+		e.disabled = previous
+		p.dirty.Store(true)
+		return fmt.Errorf("account status persistence failed")
+	}
+	return nil
+}
+
 
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
@@ -869,14 +889,14 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 				kind = "model_unavailable"
 			}
 			row := RateLimitedModel{
-				Model:  m,
-				Kind:   kind,
-				Until:  mc.Until,
-				Reason: mc.Reason,
+				Model:            m,
+				Kind:             kind,
+				Until:            mc.Until,
+				RemainingSeconds: int64(math.Ceil(mc.Until.Sub(now).Seconds())),
+				Reason:           mc.Reason,
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
-				row.ResetAt = mc.ResetAt
+			if !mc.ResetAt.IsZero() {
+				row.ResetAt = &mc.ResetAt
 			}
 			rows = append(rows, row)
 		}

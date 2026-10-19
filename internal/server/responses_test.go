@@ -1210,3 +1210,50 @@ func TestResponsesToolOutputImagesMoveToUserMessage(t *testing.T) {
 		t.Fatalf("纯文本=%#v", m)
 	}
 }
+
+func TestResponsesToChatDeepSeekInjectsAutonomousAgentRule(t *testing.T) {
+	wireWithTools := `{"model":"cn:deepseek-v4.1-flash","instructions":"system role instructions","tools":[{"type":"function","name":"exec_command"}],"input":"hi"}`
+	chatBytes, _, _, err := responsesToChat([]byte(wireWithTools))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat map[string]any
+	if err := json.Unmarshal(chatBytes, &chat); err != nil {
+		t.Fatal(err)
+	}
+	msgs := chat["messages"].([]any)
+	systemMsg := msgs[0].(map[string]any)
+	content := systemMsg["content"].(string)
+	if !strings.Contains(content, "system role instructions") {
+		t.Fatal("lost original instructions")
+	}
+	if !strings.Contains(content, "[CRITICAL EXECUTION RULE FOR AUTONOMOUS AGENT MODE]") {
+		t.Fatal("failed to inject autonomousAgentRule for DeepSeek with tools")
+	}
+
+	// Without tools, it should not inject
+	wireNoTools := `{"model":"cn:deepseek-v4.1-flash","instructions":"system role instructions","input":"hi"}`
+	chatBytesNoTools, _, _, err := responsesToChat([]byte(wireNoTools))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chatNoTools map[string]any
+	_ = json.Unmarshal(chatBytesNoTools, &chatNoTools)
+	contentNoTools := chatNoTools["messages"].([]any)[0].(map[string]any)["content"].(string)
+	if strings.Contains(contentNoTools, "AUTONOMOUS AGENT MODE") {
+		t.Fatal("injected rule when tools were absent")
+	}
+
+	// Non-DeepSeek model should not inject
+	wireNonDeepSeek := `{"model":"gpt-6.1-sol","instructions":"system role instructions","tools":[{"type":"function","name":"exec_command"}],"input":"hi"}`
+	chatBytesNonDS, _, _, err := responsesToChat([]byte(wireNonDeepSeek))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chatNonDS map[string]any
+	_ = json.Unmarshal(chatBytesNonDS, &chatNonDS)
+	contentNonDS := chatNonDS["messages"].([]any)[0].(map[string]any)["content"].(string)
+	if strings.Contains(contentNonDS, "AUTONOMOUS AGENT MODE") {
+		t.Fatal("injected rule for non-DeepSeek model")
+	}
+}

@@ -21,7 +21,8 @@ import (
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
-	mu sync.Mutex
+	mu        sync.Mutex
+	lifecycle *credentialLifecycle
 
 	AccessToken  string
 	RefreshToken string
@@ -45,11 +46,76 @@ type Auth struct {
 	DeviceToken string
 }
 
+type credentialLifecycle struct {
+	mu      sync.Mutex
+	deleted bool
+}
+
+func (a *Auth) lifecycleLocked() *credentialLifecycle {
+	if a.lifecycle == nil {
+		a.lifecycle = &credentialLifecycle{}
+	}
+	return a.lifecycle
+}
+
+func (a *Auth) ShareCredentialLifecycle(previous *Auth) {
+	if a == previous {
+		return
+	}
+	previous.mu.Lock()
+	lifecycle := previous.lifecycleLocked()
+	previous.mu.Unlock()
+	a.mu.Lock()
+	a.lifecycle = lifecycle
+	a.mu.Unlock()
+}
+
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
 func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+func (a *Auth) Deleted() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lifecycle := a.lifecycleLocked()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	return lifecycle.deleted
+}
+
+func (a *Auth) CredentialBytes() ([]byte, string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lifecycle := a.lifecycleLocked()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.deleted || a.FilePath == "" {
+		return nil, "", fmt.Errorf("credential file unavailable")
+	}
+	raw, err := os.ReadFile(a.FilePath)
+	return raw, filepath.Base(a.FilePath), err
+}
+
+func (a *Auth) RemoveCredentialFile() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lifecycle := a.lifecycleLocked()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.deleted {
+		return nil
+	}
+	if a.FilePath == "" {
+		return fmt.Errorf("credential file unavailable")
+	}
+	if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	lifecycle.deleted = true
+	return nil
+}
 
 // AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
 //
@@ -313,6 +379,12 @@ func Parse(raw []byte) (*Auth, error) {
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	lifecycle := a.lifecycleLocked()
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	if lifecycle.deleted {
+		return fmt.Errorf("save refused: account deleted")
+	}
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}

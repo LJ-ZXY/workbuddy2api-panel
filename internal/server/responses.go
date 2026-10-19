@@ -6,6 +6,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -13,7 +14,28 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 )
+
+type streamDiagnosticsKey struct{}
+type responsesSSEKey struct{}
+
+func responsesSSEFrom(r *http.Request) bool {
+	v, _ := r.Context().Value(responsesSSEKey{}).(bool)
+	return v
+}
+
+func streamDiagnosticsFrom(r *http.Request) *streamdiag.Observer {
+	o, _ := r.Context().Value(streamDiagnosticsKey{}).(*streamdiag.Observer)
+	return o
+}
+
+const autonomousAgentRule = "\n\n[CRITICAL EXECUTION RULE FOR AUTONOMOUS AGENT MODE]\n" +
+	"You are executing in a non-interactive autonomous agent tool-calling loop.\n" +
+	"1. NEVER emit text stating intent to perform further checks, edits, reads, or verifications (e.g., \"我先...\", \"现在做...\", \"我补上...\", \"接下来将...\") without invoking the corresponding tool in the EXACT SAME TURN.\n" +
+	"2. If you state or plan any subsequent action, you MUST output the corresponding tool call (exec_command, apply_patch, etc.) IMMEDIATELY in this response.\n" +
+	"3. Do NOT yield the turn, do NOT wait for user confirmation, and do NOT finish with plain text when work remains unperformed."
 
 // responsesWebsocketUnsupported 回应 Codex 的 WS 升级探测（GET /v1/responses）。
 // 426 是客户端**立刻且粘性**回落 HTTPS 的信号：Codex 的 websocket_fallback 用例确认
@@ -42,13 +64,30 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var peek struct {
-		Stream bool `json:"stream"`
+		Stream bool   `json:"stream"`
+		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(chat, &peek)
-	r2 := r.Clone(r.Context())
+	var diag *streamdiag.Observer
+	if peek.Stream && h.cfg.StreamDiagnostics != nil {
+		requestID, gatewayID := "", ""
+		if tr := requestTraceFrom(r); tr != nil {
+			requestID = tr.id
+		}
+		if ids := r.Header.Values("X-CodeBuddy-Diagnostic-ID"); len(ids) == 1 {
+			gatewayID = ids[0]
+		}
+		diag = h.cfg.StreamDiagnostics.Begin(r.URL.Path, peek.Model, requestID, gatewayID)
+	}
+	defer func() { diag.Complete(r.Context().Err() != nil) }()
+	ctx := context.WithValue(r.Context(), responsesSSEKey{}, true)
+	if diag != nil {
+		ctx = context.WithValue(ctx, streamDiagnosticsKey{}, diag)
+	}
+	r2 := r.Clone(ctx)
 	r2.Body = io.NopCloser(bytes.NewReader(chat))
 	r2.ContentLength = int64(len(chat))
-	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream, meta: meta}
+	rw := &responsesWriter{ResponseWriter: w, stream: peek.Stream, meta: meta, diag: diag, trace: requestTraceFrom(r), ctx: r.Context()}
 	defer rw.finish()
 	h.chatCompletions(rw, r2)
 }
@@ -94,7 +133,16 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 		out["tool_choice"] = meta.flatToolChoice(v)
 	}
 	msgs := []any{}
-	if inst, ok := obj["instructions"].(string); ok && inst != "" {
+	inst, _ := obj["instructions"].(string)
+	modelStr, _ := obj["model"].(string)
+	if strings.Contains(strings.ToLower(modelStr), "deepseek") && out["tools"] != nil {
+		if inst != "" {
+			inst += autonomousAgentRule
+		} else {
+			inst = strings.TrimPrefix(autonomousAgentRule, "\n\n")
+		}
+	}
+	if inst != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": inst})
 	}
 	switch in := obj["input"].(type) {
@@ -868,10 +916,15 @@ type responsesWriter struct {
 	body    []byte
 	x       streamState
 	meta    *responsesMeta
+	diag    *streamdiag.Observer
+	trace   *requestTrace
+	ctx     context.Context
 }
 
 type streamState struct {
 	created, failed, completed bool
+	toolFinish                 bool
+	validToolItems             int
 	// sawFinish/sawDone 上游正常收尾的两种标志：finish_reason 与 [DONE]。
 	// 两者都没有就结束 = 异常 EOF / 断流，此时工具载荷不可信（见 closeOpenItems）。
 	sawFinish, sawDone    bool
@@ -1099,6 +1152,9 @@ func (w *responsesWriter) handleChunk(obj map[string]any) error {
 // max_output_tokens / content_filter 都不允许伪装成 completed，否则客户端
 // （Codex）会把被截断的输出当作完整结果。
 func (w *responsesWriter) applyFinishReason(fr string) {
+	if strings.TrimSpace(fr) == "tool_calls" || strings.TrimSpace(fr) == "function_call" {
+		w.x.toolFinish = true
+	}
 	status, details := responsesStatusFromFinish(fr)
 	if status != "" {
 		w.x.status = status
@@ -1367,6 +1423,7 @@ func (w *responsesWriter) closeOpenItems() error {
 			return err
 		}
 		w.x.output = append(w.x.output, item)
+		w.x.validToolItems++
 		acc.closed = true
 	}
 	return nil
@@ -1457,6 +1514,9 @@ func (w *responsesWriter) closeMessage() error {
 func (w *responsesWriter) emitCompleted() error {
 	if w.x.completed || w.x.failed {
 		return nil
+	}
+	if w.x.toolFinish && w.x.validToolItems == 0 && w.x.status != "incomplete" {
+		w.diag.ToolFinishWithoutValidTool()
 	}
 	w.x.completed = true
 	typ, status := "response.completed", "completed"

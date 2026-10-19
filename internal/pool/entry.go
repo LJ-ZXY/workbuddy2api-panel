@@ -3,6 +3,7 @@ package pool
 
 import (
 	"math"
+	"encoding/json"
 	"sync/atomic"
 	"time"
 
@@ -107,7 +108,7 @@ type Status struct {
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
-	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+	RateLimitedModels []RateLimitedModel `json:"rate_limited_models"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm string `json:"realm,omitempty"`
@@ -146,6 +147,14 @@ type Status struct {
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
 
+func (s Status) MarshalJSON() ([]byte, error) {
+	type wireStatus Status
+	if s.RateLimitedModels == nil {
+		s.RateLimitedModels = []RateLimitedModel{}
+	}
+	return json.Marshal(wireStatus(s))
+}
+
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
 // tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
 // 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
@@ -167,9 +176,9 @@ type RateLimitedModel struct {
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
-	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；
-	// 截断后 Until==ResetAt 时省略 ResetAt 让台账自然减少一列。
-	ResetAt time.Time `json:"reset_at,omitempty"`
+	RemainingSeconds int64 `json:"remaining_seconds"`
+	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
+	ResetAt *time.Time `json:"reset_at,omitempty"`
 	// Reason 触发原因（运维可读文案）。
 	Reason string `json:"reason,omitempty"`
 }

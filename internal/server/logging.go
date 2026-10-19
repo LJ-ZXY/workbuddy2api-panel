@@ -436,8 +436,9 @@ type requestTrace struct {
 	// 来源采集与归档已覆盖 /v1/responses、/v1/messages，不能再写死 chat 路径。
 	path string
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
-	clientIP  string
-	userAgent string
+	clientIP        string
+	userAgent       string
+	protocolFailure bool
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -516,6 +517,9 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	if t.protocolFailure {
+		e.Outcome = reqlog.OutcomeStreamError
+	}
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess
