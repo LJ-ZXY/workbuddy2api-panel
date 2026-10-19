@@ -1594,7 +1594,7 @@ func (w *responsesWriter) emitCompleted() error {
 	if w.x.completed || w.x.failed {
 		return nil
 	}
-	if w.x.toolFinish && w.x.validToolItems == 0 && w.x.status != "incomplete" {
+	if w.x.toolFinish && w.x.validToolItems == 0 && w.x.status != "incomplete" && w.diag != nil {
 		w.diag.ToolFinishWithoutValidTool()
 	}
 	w.x.completed = true
@@ -1645,6 +1645,11 @@ func (w *responsesWriter) emit(typ string, payload map[string]any) error {
 	// ponytail: 当前 Responses wire 契约要求每个事件带递增 sequence_number（Codex 会读）。
 	payload["sequence_number"] = w.x.seq
 	w.x.seq++
+	// 观测点：与 messagesWriter.emit 对称。观察器只读 type / item / delta.stop_reason
+	// 等封闭枚举与 output_index，绝不落正文；nil 观察器为零开销。
+	if w.diag != nil {
+		w.diag.Event(typ, payload, false)
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err

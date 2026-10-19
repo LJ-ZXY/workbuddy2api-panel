@@ -96,6 +96,7 @@ type Metadata struct {
 	DoneMarkers            uint64            `json:"upstream_done_markers"`
 	EndReasons             map[string]uint64 `json:"upstream_end_reasons"`
 	ContinuationAttempts   uint64            `json:"continuation_attempts"`
+	PseudoFinishNudges     uint64            `json:"pseudo_finish_nudges,omitempty"`
 	ContinuationSkips      map[string]uint64 `json:"continuation_skips"`
 	ResponseEvents         map[string]uint64 `json:"response_events"`
 	UnknownEvents          uint64            `json:"unknown_events"`
@@ -309,6 +310,12 @@ func (o *Observer) Skip(reason SkipReason) {
 func (o *Observer) ContinuationAttempt() {
 	if o != nil {
 		o.m.ContinuationAttempts++
+	}
+}
+
+func (o *Observer) PseudoFinishNudge() {
+	if o != nil {
+		o.m.PseudoFinishNudges++
 	}
 }
 

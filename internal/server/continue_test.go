@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -710,8 +711,14 @@ func TestContinueReaderPseudoFinishAutoNudge(t *testing.T) {
 		return 200, seg2ToolCall
 	})
 
+	dir := t.TempDir()
+	rec := streamdiag.New(dir)
+	t.Cleanup(rec.Close)
+	diag := rec.Begin("/v1/responses", "deepseek-v4.1-flash", "req-1", "dg_1")
+	ctx := context.WithValue(context.Background(), streamDiagnosticsKey{}, diag)
+	acct := &auth.Auth{UID: "u1", AccessToken: "at-1", ExpiresAt: 9999999999}
 	body := `{"model":"deepseek-v4.1-flash","tools":[{"type":"function","name":"exec_command"}],"messages":[{"role":"user","content":"check status"}]}`
-	r := newTestContinueReader(t, up, body, io.NopCloser(strings.NewReader(seg1PseudoFinish)))
+	r := newContinueReader(ctx, up, acct, []byte(body), "1.2.3.4", upstream.ChatMeta{}, io.NopCloser(strings.NewReader(seg1PseudoFinish)))
 
 	out, err := io.ReadAll(r)
 	if err != nil {
@@ -734,5 +741,15 @@ func TestContinueReaderPseudoFinishAutoNudge(t *testing.T) {
 	}
 	if !strings.Contains(s, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("最终终态应为 tool_calls:\n%s", s)
+	}
+
+	diag.Complete(false)
+	rec.Close()
+	metas := readDiagnostics(t, dir)
+	if len(metas) != 1 {
+		t.Fatalf("diagnostics records = %d", len(metas))
+	}
+	if metas[0].PseudoFinishNudges != 1 {
+		t.Fatalf("PseudoFinishNudges = %d want 1", metas[0].PseudoFinishNudges)
 	}
 }

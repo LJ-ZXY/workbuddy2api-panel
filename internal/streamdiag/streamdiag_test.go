@@ -414,6 +414,10 @@ func TestMessagesObserverLifecycle(t *testing.T) {
 	if m.StopReasons["tool_use"] != 1 || m.ToolUseBlocks != 1 || m.TextBlocks != 1 || m.ThinkingBlocks != 1 {
 		t.Fatalf("stop/blocks = %+v %d/%d/%d", m.StopReasons, m.ToolUseBlocks, m.TextBlocks, m.ThinkingBlocks)
 	}
+	o.PseudoFinishNudge()
+	if o.m.PseudoFinishNudges != 1 {
+		t.Fatalf("pseudo finish nudges = %d want 1", o.m.PseudoFinishNudges)
+	}
 	if m.ResponseEvents["message_start"] != 1 || m.ResponseEvents["message_stop"] != 1 {
 		t.Fatalf("anthropic events not counted: %+v", m.ResponseEvents)
 	}

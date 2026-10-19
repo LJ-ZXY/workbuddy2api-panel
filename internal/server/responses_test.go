@@ -12,6 +12,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/streamdiag"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -1307,5 +1308,45 @@ func TestResponsesToChatCodexPromptNeutralization(t *testing.T) {
 	lastUserMsg := msgs[len(msgs)-1].(map[string]any)["content"].(string)
 	if !strings.Contains(lastUserMsg, "[SYSTEM REMINDER: Do not reply with text intent") {
 		t.Fatal("missing tail execution reminder on last user message")
+	}
+}
+
+// Responses 接入事件级观测后，转发字节必须与未接线时完全一致（观测层零副作用）。
+func TestResponsesDiagnosticsObserveWithoutChangingWire(t *testing.T) {
+	dir := t.TempDir()
+	rec := streamdiag.New(dir)
+	t.Cleanup(rec.Close)
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	body := `{"model":"deepseek-v4.1-flash","stream":true,"input":"hi","tools":[{"type":"function","name":"exec_command"}]}`
+
+	off := httptest.NewRecorder()
+	NewHandler(Config{Pool: p, Upstream: up}).ServeHTTP(off,
+		httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+
+	on := httptest.NewRecorder()
+	NewHandler(Config{Pool: p, Upstream: up, StreamDiagnostics: rec}).ServeHTTP(on,
+		httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+
+	if off.Code != on.Code || off.Body.String() != on.Body.String() {
+		t.Fatalf("diagnostics changed wire output:\n off=%s\n on =%s", off.Body.String(), on.Body.String())
+	}
+	rec.Close()
+	metas := readDiagnostics(t, dir)
+	if len(metas) != 1 {
+		t.Fatalf("diagnostics records = %d", len(metas))
+	}
+	meta := metas[0]
+	if meta.Protocol != "responses" || meta.Path != "/v1/responses" {
+		t.Fatalf("protocol/path = %q/%q", meta.Protocol, meta.Path)
+	}
+	if meta.ResponseEvents["response.created"] != 1 || meta.ResponseEvents["response.completed"] != 1 {
+		t.Fatalf("events = %+v", meta.ResponseEvents)
+	}
+	if meta.TerminalCompleted != 1 || meta.ItemAdded == 0 || meta.ItemDone == 0 {
+		t.Fatalf("terminal/items = %d/%d/%d", meta.TerminalCompleted, meta.ItemAdded, meta.ItemDone)
+	}
+	if meta.FirstResponseMS < 0 {
+		t.Fatal("first response time not recorded")
 	}
 }

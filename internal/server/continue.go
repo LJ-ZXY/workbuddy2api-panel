@@ -347,6 +347,9 @@ func (r *continueReader) endSegment(sawDone bool) {
 				if isPseudo {
 					r.nudgeRetried = true
 					r.isPseudoFinish = false
+					if r.diag != nil {
+						r.diag.PseudoFinishNudge()
+					}
 				}
 				if r.diag != nil {
 					r.diag.ContinuationAttempt()
