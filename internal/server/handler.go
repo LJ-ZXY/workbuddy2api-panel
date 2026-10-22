@@ -78,6 +78,10 @@ type Config struct {
 	Audit *AuditLog
 	// BudgetLimit <=0 不拦。按 CST 日累计观测到的 credit。
 	BudgetLimit float64
+	// BurstCreditLimit <=0 不拦：5 分钟窗口内累计 credit 达此值即拒（issue #229）。
+	BurstCreditLimit float64
+	// CacheLowRate <=0 不拦：连续 5 轮命中率低于此百分比即冷却 60s（issue #229）。
+	CacheLowRate float64
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
 
@@ -182,6 +186,7 @@ func NewHandler(cfg Config) *Handler {
 		taskRunning: map[string]bool{},
 		budget:      newDailyBudget(cfg.BudgetLimit),
 	}
+	h.budget.setGuards(cfg.BurstCreditLimit, cfg.CacheLowRate)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	// Codex 客户端在 supports_websockets/prefer_websockets 时先探 GET /v1/responses 升级 WS。
@@ -294,7 +299,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
-	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
+	budgetUsed, budgetLimit, budgetRejected, budgetLastReject := h.budget.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
@@ -324,10 +329,11 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"per_model":    exploreLast,
 		},
 		"daily_budget": map[string]any{
-			"used":     budgetUsed,
-			"limit":    budgetLimit,
-			"rejected": budgetRejected,
-			"day":      cstDay(time.Now()),
+			"used":        budgetUsed,
+			"limit":       budgetLimit,
+			"rejected":    budgetRejected,
+			"last_reject": budgetLastReject,
+			"day":         cstDay(time.Now()),
 		},
 	})
 }
@@ -638,10 +644,15 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	if !h.budget.admit() {
-		used, limit, _ := h.budget.snapshot()
-		writeOpenAIError(w, http.StatusTooManyRequests, "daily_budget_exceeded",
-			fmt.Sprintf("daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit))
+	if ok, why := h.budget.admit(); !ok {
+		used, limit, _, _ := h.budget.snapshot()
+		code, msg := "daily_budget_exceeded", fmt.Sprintf(
+			"daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit)
+		if why != "" {
+			// 快速闸的拒因自带可读说明，别和「当日用光」混成一句话
+			code, msg = "credit_guard_tripped", why
+		}
+		writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
 		return
 	}
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
@@ -941,12 +952,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if !busyWaited {
 				if blk := h.cfg.Pool.ModelBlockedForRealm(bareModel, realm); blk.Blocked {
 					if d := busyWaitFor(blk, time.Now(), busyWaitCap); d > 0 {
-						if !sleepCtx(r.Context(), jitterDur(d)) {
-							break
+						w := waitPast(d)
+						log.Printf("busy-wait: model=%s realm=%q %d account(s) busy, waiting %s then retry once (issue #46)", bareModel, realm, blk.Count, w.Round(time.Millisecond))
+						if !sleepCtx(r.Context(), w) {
+							break // 客户端已断连：不必再等
 						}
 						busyWaited = true
 						modelBlock = blk
-						i--
+						i-- // 等待不算一次换号：槽位留给真正的尝试
 						continue
 					}
 				}
@@ -1380,6 +1393,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint := upstream.NoHealthyAccountHint()
+	// 轮转耗尽 / WAF 止损等其它退出路径不经过选号失败分支，modelBlock 还是零值：
+	// 在这里补一次快照。否则同一件「全池该模型只是忙」的事，走选号失败是
+	// 503 model_busy + Retry-After，走轮转耗尽却是 429 rate_limit_exceeded 且没有
+	// Retry-After（MaxRotate=1 时必现）。
+	if !modelBlock.Blocked {
+		modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+	}
+
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false

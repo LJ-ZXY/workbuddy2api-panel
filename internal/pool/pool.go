@@ -52,6 +52,7 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	creditFloorMaxRate float64
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -285,6 +286,22 @@ func (p *Pool) SetCreditFloor(n int64) {
 	if n >= 0 {
 		p.creditFloor = n
 	}
+}
+
+// SetCreditFloorMaxRate 注入保底兜底的倍率上限。0 = 严格模式；负值非法保留原值。
+func (p *Pool) SetCreditFloorMaxRate(v float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if v >= 0 {
+		p.creditFloorMaxRate = v
+	}
+}
+
+// CreditFloorMaxRate 透出生效的倍率上限（面板/status 用）。0 = 严格模式。
+func (p *Pool) CreditFloorMaxRate() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creditFloorMaxRate
 }
 
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。

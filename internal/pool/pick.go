@@ -297,7 +297,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if err != nil {
 		return false // 倍率非数值（异常形态）：不据此惩罚账号
 	}
-	return v > 0
+	return v > p.creditFloorMaxRate
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -323,6 +323,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+			continue // 保留积分停牌号不参与兜底：不能因为其余号都在冷却就捞回停牌号接付费模型
 		}
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）

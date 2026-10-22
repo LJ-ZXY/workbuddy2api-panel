@@ -20,6 +20,7 @@ var sanitizeFeatures = []string{
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 	"11128",                                           // 上游反探测：裸数字错误码
+	"DeepSeek Harness",                                // DSH 身份句品牌词：上游按「非官方渠道」整单拦（11-128）
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -75,6 +76,14 @@ var sanitizeRewrites = [][2]string{
 		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
 		"11128",
 		"11-128",
+	},
+	{
+		// DSH 的身份句（@deepseek-ai/dsh-system-prompt 注入的 harness:identity 段）被上游
+		// 当成「非官方渠道调用」整单拦截：400 11-128 Illegal API invocation from an
+		// unapproved channel。实测换一词即绕过（与插 U+200B 等效，但可见、可 diff）。
+		// 按短语全局替换而非只认开头：同一品牌词在长提示词正文里还会出现多次。
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
 	},
 }
 

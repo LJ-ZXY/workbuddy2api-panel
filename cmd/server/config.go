@@ -247,6 +247,10 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorMaxRate 保底兜底允许的目录倍率上限（issue #30 / PR #2）。
+		// 0.2 = 便宜模型（x0.11 这类）在触底号上放行入账，x1.62 这类仍按收费拦。
+		// 0 = 严格模式（任何已知正倍率都拦）；负值钳 0。面板「积分保底」档位旁可改。
+		CreditFloorMaxRate float64 `json:"credit_floor_max_rate"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -281,6 +285,11 @@ type Config struct {
 	} `json:"alerting"`
 	Budget struct {
 		DailyCreditLimit float64 `json:"daily_credit_limit"` // 0 = 不限
+		// BurstCreditLimit 5 分钟窗口内累计 credit 达此值即拒绝（0 = 关闭）。
+		// issue #229：高倍率模型 140k 上下文一次 20+ 积分，日上限止血太慢。
+		BurstCreditLimit float64 `json:"burst_credit_limit"`
+		// CacheLowRate 连续 5 轮缓存命中率低于此百分比即冷却 60s（0 = 关闭）。
+		CacheLowRate float64 `json:"cache_low_rate"`
 	} `json:"budget"`
 
 	// 解析后
@@ -696,6 +705,11 @@ func (c *Config) normalize() error {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+	// 保底倍率上限：负值钳 0（= 严格模式，任何已知正倍率都拦）。
+	// 不设非零默认是有意的——这是钱相关开关，升级不该静默放宽既有防护。
+	if c.Pool.CreditFloorMaxRate < 0 {
+		c.Pool.CreditFloorMaxRate = 0
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -787,6 +801,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Budget.DailyCreditLimit < 0 {
 		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 不限", c.Budget.DailyCreditLimit)
+	}
+	if c.Budget.BurstCreditLimit < 0 {
+		return fmt.Errorf("budget.burst_credit_limit: %v 不得为负；0 = 关闭", c.Budget.BurstCreditLimit)
+	}
+	if c.Budget.CacheLowRate < 0 || c.Budget.CacheLowRate > 100 {
+		return fmt.Errorf("budget.cache_low_rate: %v 须在 0-100 之间（百分比）；0 = 关闭", c.Budget.CacheLowRate)
 	}
 	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("admin.enabled=true 但 api_key 为空")
