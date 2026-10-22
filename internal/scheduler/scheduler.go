@@ -66,6 +66,14 @@ type Config struct {
 	SweepRunner func() (int, string)
 	// JitterMinutes 名义整点之后的确定性偏移窗口。0 = 精确整点。
 	JitterMinutes int
+	// AccountSpreadMinutes 账号级摊开窗口（issue #45）：排程触发的账号遍历型任务
+	// 把每个账号放在窗口内各自的偏移上（见 spread.go）。0 = 关闭（同一秒打全池）。
+	AccountSpreadMinutes int
+	// AccountSpreadMinGapSeconds 同批两个账号的最小间隔（冲突时推开）。0 = 只做随机。
+	AccountSpreadMinGapSeconds int
+	// RunStampFile 启动补跑去重记录的落盘路径（见 runstamps.go）。空 = 不持久化，
+	// 每次重启都补一轮（旧行为）。
+	RunStampFile string
 }
 
 // Scheduler 调度器。
@@ -76,6 +84,9 @@ type Scheduler struct {
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
 	mu         sync.Mutex
 	adoptTried map[string]string
+
+	// stampMu 串行化补跑标记文件的读写（见 runstamps.go）。
+	stampMu sync.Mutex
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与两个
@@ -89,6 +100,16 @@ type Scheduler struct {
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。sweepInterval 同款，用于补领清扫。
 	balanceInterval atomic.Int64
 	sweepInterval   atomic.Int64
+
+	// compGuardMu/compGuard 补偿「本期已试过」记账（key = uid + "|" + end_time）。
+	//
+	// 为什么需要：上游 compensation-status 的 claimed 字段**恒为 false**（2026-10-20 实测，
+	// 已领过的号照样回 claimed:false），于是 Pending() 恒真 → 每次签到都重复 claim 一遍
+	// 全池 350 个号，白打请求却永远拿不到新发放。
+	// 只记进程内：重启后每期再试一次，代价可接受（次数极少），也不会漏掉上游新开的期次
+	// （end_time 变了就是新 key）。
+	compGuardMu sync.Mutex
+	compGuard   map[string]bool
 
 	// authHealMu/authHealAt 401→refresh 求证的退避记账（uid → 上次求证成功时刻）。
 	// 降级 token（billing 恒 401、chat 仍可用）会让每轮探测都 401，不设退避就是每
@@ -152,6 +173,9 @@ type ScheduleParams struct {
 	IncludeDisabledInTasks bool
 
 	JitterMinutes int
+	// AccountSpreadMinutes / AccountSpreadMinGapSeconds 见 Config 同名字段。
+	AccountSpreadMinutes       int
+	AccountSpreadMinGapSeconds int
 }
 
 // ExpiringSoonWindow 返回当前快过期路由窗口（读取时与热配置写在 schedMu 下同步）。
@@ -197,6 +221,8 @@ func (s *Scheduler) Reconfigure(p ScheduleParams) {
 	s.cfg.GrowthDisabled = p.GrowthDisabled
 	s.cfg.IncludeDisabledInTasks = p.IncludeDisabledInTasks
 	s.cfg.JitterMinutes = p.JitterMinutes
+	s.cfg.AccountSpreadMinutes = p.AccountSpreadMinutes
+	s.cfg.AccountSpreadMinGapSeconds = p.AccountSpreadMinGapSeconds
 	s.schedMu.Unlock()
 	poke(s.rearmSchedule)
 	poke(s.rearmBalance)
@@ -278,6 +304,8 @@ func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Dura
 func nextFireKind(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
 	var earliest time.Time
 	for _, hour := range hours {
+		// 时点按上游自然日的钟点解释（CST），不按宿主时区：UTC 容器里配 [10] 若用
+		// now.Location() 会跑在 CST 18:00（见 internal/cst 的包注释）。
 		local := now.In(cst.Loc)
 		for d := 0; d < 2; d++ {
 			nominal := time.Date(local.Year(), local.Month(), local.Day(), hour, 0, 0, 0, cst.Loc).AddDate(0, 0, d)
@@ -357,6 +385,9 @@ func (s *Scheduler) missedToday(now time.Time) []taskKind {
 			continue // 未配小时数：本来就不跑
 		}
 		if sl.at.Year() != now.Year() || sl.at.YearDay() != now.YearDay() {
+			if s.ranToday(sl.kind, now) {
+				continue // 今天已补跑过一轮：重启不该再把同样的请求打一遍
+			}
 			out = append(out, sl.kind)
 		}
 	}
@@ -470,15 +501,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 	// 启动补跑：进程停机（部署 / 重启 / 崩溃）跨过今天的时点，迟到唤醒补跑救不了
 	// ——它只管进程活着时 timer 被睡眠冻结。这里补一轮：各任务按天幂等，
 	// 窗口类（夜猫子）自带守卫，重复一轮不会打出无意义请求。
-	if missed := s.missedToday(time.Now()); len(missed) > 0 {
+	if missed := s.missedToday(cst.Now()); len(missed) > 0 {
 		log.Printf("启动补跑：%v（今天的时点已过）", missed)
 		if !sleepCtx(ctx, wakeupGraceDelay) {
 			return // 开机瞬间网络/DNS 可能未就绪（同 issue #152 的宽限口径）
 		}
 		s.runBatch(ctx, missed)
+		s.markRan(missed, cst.Now())
 	}
 	for {
-		next, kinds := s.nextWake(time.Now())
+		next, kinds := s.nextWake(cst.Now())
 		if next.IsZero() {
 			// 四类任务全部禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
 			select {
@@ -510,31 +542,56 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
+// spreadRunning 窗口 > 0 时各任务族的「上一批还没收尾」标记。
+//
+// 摊开会把一批从几十秒拉长到数十分钟，跨过下一个时点；没有它，下一时点会再派一批
+// 同类任务，两批在同一模型/同一账号上并发叠加——摊开换来的相关性收益当场还回去。
+var spreadRunning [6]atomic.Bool
+
 // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
 // ctx 取消时由各任务内部的可取消等待快速收尾。
+//
+// 账号摊开启用时不等待：一批可能持续到下一个时点，等它等于让后面所有时点排队漏跑
+// （Run() 只挑现在之后的时点，过了就是漏掉，不是延迟）。收尾靠 spreadRunning。
 func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	spread := s.spreadEnabled()
 	var wg sync.WaitGroup
 	for _, k := range kinds {
+		if spread && !spreadRunning[k].CompareAndSwap(false, true) {
+			log.Printf("spread: %s 上一批尚未收尾，跳过本时点", k)
+			continue
+		}
 		wg.Add(1)
 		go func(k taskKind) {
 			defer wg.Done()
+			if spread {
+				defer spreadRunning[k].Store(false)
+			}
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.runCheckin(ctx, spread)
 			case taskTravel:
-				s.RunTravelNow()
+				s.runTravel(ctx, spread)
 			case taskActivity:
-				s.runActivity(ctx)
+				s.runActivity(ctx, spread)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runKeepalive(ctx, spread)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.runBlackcat(ctx, spread)
 			case taskGrowth:
 				s.RunGrowthNow()
 			}
 		}(k)
 	}
-	wg.Wait()
+	if !spread {
+		wg.Wait()
+	}
+}
+
+// spreadEnabled 账号摊开是否启用（窗口 > 0）。
+func (s *Scheduler) spreadEnabled() bool {
+	w, _ := s.spreadParams()
+	return w > 0
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -560,6 +617,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	s.runCheckin(context.Background(), false)
+}
+
+// runCheckin 签到遍历。spread=true（排程路径）时按账号级偏移错开，见 spread.go。
+func (s *Scheduler) runCheckin(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskCheckin, spread, cst.Now())
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -567,7 +630,10 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		// 无 refresh token 的账号默认跳过（保号以刷新为前提）；静态 API Key 例外——
+		// 它没有 refresh token 也不需要刷新，但下方余额刷新（企业口径）是 credit_floor
+		// 与面板额度的唯一数据源，必须照跑。带 access token 的 JWT 账号保持现状跳过。
+		if a == nil || (a.RefreshTokenValue() == "" && !a.IsAPIKey()) {
 			continue
 		}
 		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
@@ -576,11 +642,14 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
+		if !plan.wait(ctx, st.UID) {
+			return // ctx 取消：剩余账号下轮再签
+		}
 		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
 		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
+		if a.SupportsPersonalEndpoints() {
 			// 先查活动状态（只读）：本机 checkin_done 只记录我们自己发起的签到，用户从手机 /
 			// 官方客户端签过就看不到；上游 today_checked_in 才是权威事实。已签则直接记账跳过
 			// （省掉 21:00 那一轮注定被幂等拒绝的写调用），顺带把连登与活动截止落进日志；
@@ -641,11 +710,12 @@ func (s *Scheduler) RunCheckinNow() {
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
 // runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), false)
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+func (s *Scheduler) runActivity(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskActivity, spread, cst.Now())
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -660,8 +730,11 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——两者对企业号都是 403
 		// （「growth system is only available for personal users」），即零收益。
 		// 该类「静默无效」最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
-		if a.IsEnterprise() {
+		if !a.SupportsPersonalGrowth() {
 			continue
+		}
+		if !plan.wait(ctx, st.UID) {
+			return // ctx 取消：剩余账号下轮再报
 		}
 		// 注意：活跃上报**不**跳过 global 账号（上游 a190252 同口径）。国际版
 		// /v2/report 在 workbuddy.ai 上实测 code=0 可用（PR #45），billingBase(a)
@@ -713,6 +786,12 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runKeepalive(context.Background(), false)
+}
+
+// runKeepalive 保活遍历。spread=true（排程路径）时按账号级偏移错开，见 spread.go。
+func (s *Scheduler) runKeepalive(ctx context.Context, spread bool) {
+	plan := s.spreadPlan(taskKeepalive, spread, cst.Now())
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -721,6 +800,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
+		}
+		if !plan.wait(ctx, st.UID) {
+			return // ctx 取消：剩余账号下轮再续
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			log.Printf("WARN: keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
