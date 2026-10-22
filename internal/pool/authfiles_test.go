@@ -73,7 +73,11 @@ func TestAuthFileSetDisabledDurablePreservesEntireEntry(t *testing.T) {
 
 func TestAuthFileStatusAndRemovePersistenceFailure(t *testing.T) {
 	dir := t.TempDir()
-	fp := filepath.Join(dir, "state.json")
+	block := filepath.Join(dir, "block")
+	if err := os.WriteFile(block, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fp := filepath.Join(block, "state.json")
 	p := New(fp)
 	defer p.Close()
 	a := &auth.Auth{UID: "u", AccessToken: "fixture", FilePath: filepath.Join(dir, "credential.json")}
@@ -81,9 +85,6 @@ func TestAuthFileStatusAndRemovePersistenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Add(a)
-	if err := os.Mkdir(fp+".tmp", 0700); err != nil {
-		t.Fatal(err)
-	}
 	if err := p.SetDisabled("u", true); err == nil {
 		t.Fatal("failed status persistence claimed success")
 	}

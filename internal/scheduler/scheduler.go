@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/cst"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
@@ -271,8 +272,9 @@ func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Dura
 func nextFireKind(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
 	var earliest time.Time
 	for _, hour := range hours {
+		local := now.In(cst.Loc)
 		for d := 0; d < 2; d++ {
-			nominal := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location()).AddDate(0, 0, d)
+			nominal := time.Date(local.Year(), local.Month(), local.Day(), hour, 0, 0, 0, cst.Loc).AddDate(0, 0, d)
 			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes))
 			if !t.After(now) {
 				continue

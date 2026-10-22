@@ -28,6 +28,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -266,6 +267,8 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		ModelAliases:         livecfg.NormalizeModelAliases(cfg.Models.Aliases),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -379,6 +382,11 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled:  cfg.Global.Enabled,
+		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
+		// Live 为 nil 的裸用/测试路径。
+		ModelsHidden:   cfg.Models.Hidden,
+		// 模型映射原始条目（issue #30）；同上，运行期以 livecfg 快照为准。
+		ModelsAliases:  cfg.Models.Aliases,
 		AdminEnabled:   cfg.Admin.Enabled,
 		MetricsEnabled: cfg.Metrics.Enabled,
 		Tasks:          sch,
@@ -613,30 +621,29 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		// 配置所在目录不可写：Docker 里 /app 属主是镜像内的 app(10001)，而 compose 让
-		// 容器以 PUID(如 1000) 运行 —— 挂载进去的 config.json 可写、目录不行，于是原子
-		// 替换连 tmp 都建不出来（issue #134：write config: open /app/config.json.tmp:
-		// permission denied）。文件本身可写就退回原地重写，不再要求目录可写。
-		if !errors.Is(err, fs.ErrPermission) {
+	// safefile：tmp fsync 后才 rename，并把上一份有效配置留成 config.json.bak
+	// —— 掉电把 config.json 留成半截时，下次启动能捡回上一份。
+	if err := safefile.WriteKeep(path, out, 0o600); err != nil {
+		switch {
+		case errors.Is(err, fs.ErrPermission):
+			// 配置所在目录不可写：Docker 里 /app 属主是镜像内的 app(10001)，而 compose 让
+			// 容器以 PUID(如 1000) 运行 —— 挂载进去的 config.json 可写、目录不行，于是原子
+			// 替换连 tmp 都建不出来（issue #134：write config: open /app/config.json.tmp:
+			// permission denied）。文件本身可写就退回原地重写，不再要求目录可写。
+			if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("write config (目录不可写，原地重写也失败): %w", inPlaceErr)
+			}
+		case errors.Is(err, syscall.EBUSY):
+			// A single-file Docker bind mount cannot be renamed over its mount
+			// target (Linux returns EBUSY / "device or resource busy"). Keep the
+			// atomic path for regular files, but update the mounted file in place
+			// for this specific deployment shape.
+		if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
+				return nil, fmt.Errorf("replace config (bind mount fallback): %w", inPlaceErr)
+			}
+		default:
 			return nil, fmt.Errorf("write config: %w", err)
 		}
-		if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
-			return nil, fmt.Errorf("write config (目录不可写，原地重写也失败): %w", inPlaceErr)
-		}
-	} else if err := os.Rename(tmp, path); err != nil {
-		// A single-file Docker bind mount cannot be renamed over its mount
-		// target (Linux returns EBUSY / "device or resource busy"). Keep the
-		// atomic path for regular files, but update the mounted file in place
-		// for this specific deployment shape.
-		if !errors.Is(err, syscall.EBUSY) {
-			return nil, fmt.Errorf("replace config: %w", err)
-		}
-		if inPlaceErr := writeConfigInPlace(path, out); inPlaceErr != nil {
-			return nil, fmt.Errorf("replace config (bind mount fallback): %w", inPlaceErr)
-		}
-		_ = os.Remove(tmp)
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
@@ -645,6 +652,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+		ModelAliases:         livecfg.NormalizeModelAliases(newCfg.Models.Aliases),
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

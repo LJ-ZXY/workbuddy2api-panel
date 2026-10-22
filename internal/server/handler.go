@@ -85,6 +85,9 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	ModelsHidden  []string
+	ModelsAliases []string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -96,7 +99,27 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		APIKey:           h.cfg.APIKey,
 		SoftCooldown:     h.cfg.SoftCooldown,
 		RecordClientInfo: h.cfg.RecordClientInfo,
+		HiddenModels:     livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
+		ModelAliases:     livecfg.NormalizeModelAliases(h.cfg.ModelsAliases),
 	}
+}
+
+// hiddenModel 报告 (realm, 裸模型名) 是否被 config models.hidden 隐藏。
+func (h *Handler) hiddenModel(realm, bare string) bool {
+	if bare == "" {
+		return false
+	}
+	_, hide := h.loadLive().HiddenModels[realm+":"+bare]
+	return hide
+}
+
+// modelAlias 查 aliases 映射（issue #30）
+func (h *Handler) modelAlias(realm, bare string) (string, bool) {
+	if bare == "" {
+		return "", false
+	}
+	target, ok := h.loadLive().ModelAliases[strings.ToLower(realm)+":"+strings.ToLower(bare)]
+	return target, ok
 }
 
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。
@@ -170,6 +193,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	// 官方 agenttool 联网检索的网关透传（非对话端点，与 images 同套取号/失败处置）。
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
+	h.mux.HandleFunc("POST /v2/chat/busy", h.withAuth(h.chatBusy))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -382,6 +406,9 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	if len(mi.Tags) > 0 {
 		entry["tags"] = mi.Tags
 	}
+	if mi.Tier != "" {
+		entry["tier"] = mi.Tier
+	}
 	if mi.Vendor != "" {
 		entry["vendor"] = mi.Vendor
 	}
@@ -421,6 +448,9 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
 	for _, mi := range h.fetchDynamicModels() {
+		if h.hiddenModel("cn", mi.ID) {
+			continue
+		}
 		entry := map[string]any{
 			"id":       "cn:" + mi.ID,
 			"object":   "model",
@@ -464,6 +494,9 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
 		for _, id := range globalIDs {
+			if h.hiddenModel("global", id) {
+				continue
+			}
 			entry := map[string]any{
 				"id":       "global:" + id,
 				"object":   "model",
@@ -511,6 +544,9 @@ func (h *Handler) generationModelEntries() []map[string]any {
 			// 只列图片：视频没有网关端点（CN 侧无查询路由、视频走连接器），列出来只会
 			// 引诱客户端去调不存在的路由。视频模型照旧不进对话名单（nonChatModel）。
 			if mi.GenerationKind != "image" {
+				continue
+			}
+			if h.hiddenModel(realm, mi.ID) {
 				continue
 			}
 			entry := map[string]any{
@@ -637,6 +673,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+
+	modelEcho := ""
+	routeModel := peek.Model
+	if aliasTarget, aliased := h.modelAlias(realm, bareModel); aliased && aliasTarget != "" {
+		var obj map[string]any
+		if json.Unmarshal(body, &obj) == nil {
+			if cur, isStr := obj["model"].(string); isStr && cur == peek.Model {
+				obj["model"] = aliasTarget
+				if nb, merr := json.Marshal(obj); merr == nil {
+					body = nb
+					realm, bareModel = resolveModel(aliasTarget)
+					modelEcho = peek.Model
+					routeModel = aliasTarget
+					log.Printf("INFO: [server] model alias applied: %s -> %s", peek.Model, aliasTarget)
+				}
+			}
+		}
+	}
+
+	if h.hiddenModel(realm, bareModel) {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
+			"model is hidden by gateway configuration, try another model", "")
+		st := newChatStat(time.Now(), body, peek.Stream, h.budget)
+		st.status = http.StatusBadRequest
+		st.outcome = reqlog.OutcomeHTTPError
+		st.done()
+		return
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -644,6 +708,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
+	st.model = routeModel
 	if tr := requestTraceFrom(r); tr != nil {
 		tr.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -657,6 +722,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	busyWaited := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -675,7 +741,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, routeModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -807,6 +873,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		degradedApplied = true
 	}
 
+	// 渠道校验兜底：上游要求 messages[0] 必须是 system（首条 user 直接 400
+	// 11-128「first message is not system prompt」，首条 developer 报
+	// unapproved channel）——2026-10-20 真机实测三条对照。custom/append 天然
+	// 以 system 开头，passthrough 透传客户端消息时可能首条就是 user，故这里统一
+	// 兜一次。只补首条缺失这一种情况，其余消息逐字不动。
+	body = prompt.EnsureSystemFirst(body, h.cfg.PromptText)
+
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
 	if bareModel != peek.Model {
@@ -865,13 +938,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
+			if !busyWaited {
+				if blk := h.cfg.Pool.ModelBlockedForRealm(bareModel, realm); blk.Blocked {
+					if d := busyWaitFor(blk, time.Now(), busyWaitCap); d > 0 {
+						if !sleepCtx(r.Context(), jitterDur(d)) {
+							break
+						}
+						busyWaited = true
+						modelBlock = blk
+						i--
+						continue
+					}
+				}
+			}
 			st.status = http.StatusServiceUnavailable
-			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
-			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-			//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
-			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
-			// 在这里取一次快照，供下方错误构造区分（吸收上游 44d6e04）。
-			modelBlock = h.cfg.Pool.ModelBlocked(bareModel)
+			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
 			break
 		}
 		st.uid = acct.UID
@@ -1138,9 +1219,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 第二个参数 true = 名单为空时启用弱判定——tools 声明在链路上丢失是
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
+			streamOpts := []upstream.StreamOption{upstream.WithMarkupRepair(repair)}
+			if modelEcho != "" {
+				streamOpts = append(streamOpts, upstream.WithModelEcho(modelEcho))
+			}
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
-			}), upstream.WithMarkupRepair(repair))
+			}), streamOpts...)
 			// 首帧否决（见 upstream.HeadVetoError）：网关一个字节都没写出，这次尝试对
 			// 客户端完全无痕——按错误类型处置账号后换号，而不是把「HTTP 200 + error 帧」
 			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
@@ -1258,6 +1343,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		ud := usageDeltaFromResponse(resp)
 		credit, total, hasCredit := usageCreditTotal(resp)
 		recordAttempt(acct.UID, ud, credit, hasCredit, attemptStarted, 0)
+		if modelEcho != "" {
+			resp["model"] = modelEcho
+		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
@@ -1295,6 +1383,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// upstreamMsgPassed 记录 error.message 是否已被上游原文占据：模型级阻塞分支
 	// 据此决定要不要覆盖 msg（上游原文优先，含 requestId）。
 	upstreamMsgPassed := false
+	retryAfterSec := 0
 	var ue *upstream.Error
 	if errors.As(lastErr, &ue) {
 		hint = h.hintOf(ue.Kind, ue.Msg, bareModel, reqHasImage, ue)
@@ -1353,6 +1442,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		status, quota = http.StatusTooManyRequests, true
 		msg = hardCreditMessage
 		hint = upstream.GatewayHint(upstream.ErrHardCredit, "", upstream.HintContext{})
+	} else if modelBlock.Blocked && modelBlockIsTransient(modelBlock.Reason) {
+		// 全池该模型只是「忙 / 被上游限流」（14003 model busy、6004 rate limit），
+		// 不是「这个模型不存在或这个号型不允许」——上游对这两种的处置完全不同：
+		// 忙是该等（官方客户端就是这么做的：查 /v2/chat/queue/status 排队），
+		// 而模型级 11102/11158 是换模型才有用。
+		//
+		// 此前一律回 400 model_unavailable，客户端（DeepSeek Harness / Codex 等）
+		// 据此判定「模型被杀、重试无意义」，高峰期就表现为「DeepSeek 用不了」，
+		// 而官方客户端同一时刻还在排队等结果（issue #24）。这里改成可重试语义：
+		// 503 + Retry-After（= 最早解封时刻）+ code=model_busy，客户端按头等待重试。
+		code = "model_busy"
+		status = http.StatusServiceUnavailable
+		if !upstreamMsgPassed {
+			msg = "model is temporarily busy on every account (per-model cooldown); retry after the cooldown window"
+		}
+		hint = fmt.Sprintf("model_busy: %d account(s) cooling down this model", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			if d := time.Until(modelBlock.Until); d > 0 {
+				secs := int(math.Ceil(d.Seconds()))
+				retryAfterSec = secs
+				hint += fmt.Sprintf("; earliest unblock in %ds", secs)
+			}
+		}
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+			hint += "; upstream: " + s
+		}
 	} else if modelBlock.Blocked {
 		code = "model_unavailable"
 		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
@@ -1368,6 +1483,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			hint += "; upstream: " + s
 		}
 		status = http.StatusBadRequest
+	}
+	if retryAfterSec > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
 	}
 	if quota {
 		writeOpenAIQuotaError(w, msg, hint)
@@ -1387,6 +1505,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // hardCreditMessage 池内无号可试、原因全是积分耗尽时的自有文案（无上游原文可
 // 透传的场合；与 gateway_hint 并列，不重复 hint 的「等签到恢复」指向）。
 const hardCreditMessage = "all accounts have exhausted upstream credits; retry after credits are restored (daily check-in or add-on packs)"
+
+// modelBlockIsTransient 判断模型级冷却的原因是「暂时忙/被限流」还是「确定性拒绝」。
+//
+// 依据是写冷却时存下的 Reason 原文（pool.CooldownModelBusy / CooldownSoftForModel
+// 写入，来源就是上游 body）：
+//   - 瞬时（可重试）：14003「模型繁忙」、6004「模型限流」；
+//   - 确定性（换模型才有效）：11102「该后端无此模型」、11158「号型不允许」。
+//
+// 两者此前都回 400 model_unavailable，等于把高峰期的一次忙判成「模型永久不可用」，
+// 客户端据此不重试——官方客户端同一时刻还在 /v2/chat/queue/status 排队（issue #24）。
+func modelBlockIsTransient(reason string) bool {
+	s := strings.ToLower(reason)
+	if s == "" {
+		return false
+	}
+	for _, marker := range []string{"14003", "6004", "model busy", "model rate limit", "rate limit"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。（吸收上游 8b18ab8）
 //
@@ -1559,6 +1699,13 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			retryAfter = time.Now().Add(uerr.RetryAfter)
 		}
 		if modelRateLimited {
+			// 14003 是「模型繁忙」：没有恢复时刻，上游文案就是让客户端换模型/稍后
+			// 重试，不是这个号被限流。给独立短窗口（10s 起、封顶 1m），不套 soft_rate
+			// 的 600s→2h 阶梯，否则一次抖动就是十分钟不可用。
+			if retryAfter.IsZero() && upstream.IsModelBusy(body) {
+				h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
+				return
+			}
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, "model rate limit")
 			return
 		}
@@ -1655,10 +1802,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 「不知道原因的失败」的兜底，有权威分类的请求级错误不该重复计罚）。
 		// 终止轮转与 400 透传原文由 chatCompletions 的请求级参数分支负责。
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
-		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
+		// 11102「该后端无此模型」/11158「该账号类型无此模型权限」：
+		// (账号, 模型) 负缓存避让。复用 modelCooldowns 机制（与 6004 同域），
+		// 选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
-		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReasonFor(body))
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 		// ErrClient（未知 4xx）喂连败计数（issue #114）：连续 N 次该形态失败 →

@@ -34,7 +34,7 @@ func (c *Client) ProbeAccountModels(ctx context.Context, a *auth.Auth) ([]accoun
 		return nil, accountmodels.InvalidCredentials
 	}
 	probes := []struct{ path, ua string }{
-		{"/v3/config", codeBuddyIDEUA}, {"/v3/config", codeBuddyCLIUA}, {enterprisePath, codeBuddyCLIUA},
+		{"/v3/config", c.v3ProbeUA(a)}, {"/v3/config", c.v3ProbeUALite(a)}, {enterprisePath, c.v3ProbeUALite(a)},
 	}
 	byID := make(map[string]accountmodels.Model)
 	succeeded := false

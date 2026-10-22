@@ -43,9 +43,9 @@ func TestProbeAccountModelsExactCredentialsAndNoSharedCaches(t *testing.T) {
 		if token != realm+"-"+enterprise {
 			t.Error("mixed account credentials")
 		}
-		origin, language := "https://www.codebuddy.cn", "zh-CN"
+		origin, language := "https://www.codebuddy.cn", "zh"
 		if realm == "global" {
-			origin, language = "https://www.workbuddy.ai", "en-US"
+			origin = "https://www.workbuddy.ai"
 		}
 		if r.Header.Get("Origin") != origin || r.Header.Get("Referer") != origin+"/" || r.Header.Get("Accept-Language") != language ||
 			r.Header.Get("X-Machine-ID") != deriveAccountStableID("same-uid", "machine") || r.Header.Get("X-Session-ID") != deriveAccountStableID("same-uid", "session") ||
@@ -166,7 +166,7 @@ func TestProbeAccountModelsUnionFallbackEmptyAndSafeErrors(t *testing.T) {
 		{"union", func(r *http.Request) (*http.Response, error) {
 			id := "enterprise"
 			if r.URL.Path == "/v3/config" {
-				if r.Header.Get("User-Agent") == codeBuddyIDEUA {
+				if r.Header.Get("User-Agent") == v3ProbeUACNForTest {
 					id = "ide"
 				} else {
 					id = "cli"
