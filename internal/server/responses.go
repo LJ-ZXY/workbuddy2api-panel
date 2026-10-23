@@ -130,7 +130,9 @@ func cleanIntermediaryUpdates(text string) string {
 	return text[:start] + intermediaryOverride + text[end:]
 }
 
-func cleanDeepSeekCodexMessages(msgs []any) {
+// cleanCodexAgentMessages 中和 Codex 的 Intermediary updates 指令，并在末尾追加工具直调提醒。
+// 适用于腾讯 CodeBuddy 账号池下所有进入自主 Agent 工具循环的模型。
+func cleanCodexAgentMessages(msgs []any) {
 	var lastUserMsg map[string]any
 	for _, raw := range msgs {
 		m, ok := raw.(map[string]any)
@@ -210,8 +212,7 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 	}
 	msgs := []any{}
 	inst, _ := obj["instructions"].(string)
-	modelStr, _ := obj["model"].(string)
-	if strings.Contains(strings.ToLower(modelStr), "deepseek") && out["tools"] != nil {
+	if out["tools"] != nil {
 		if inst != "" {
 			inst += autonomousAgentRule
 		} else {
@@ -229,8 +230,8 @@ func responsesToChat(src []byte) ([]byte, *responsesMeta, []serverSearchTool, er
 	case []any:
 		msgs = append(msgs, convertInputItems(in, meta)...)
 	}
-	if strings.Contains(strings.ToLower(modelStr), "deepseek") && out["tools"] != nil {
-		cleanDeepSeekCodexMessages(msgs)
+	if out["tools"] != nil {
+		cleanCodexAgentMessages(msgs)
 	}
 	out["messages"] = msgs
 	b, err := json.Marshal(out)

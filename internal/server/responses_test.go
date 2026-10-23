@@ -72,11 +72,11 @@ func TestResponsesToChat(t *testing.T) {
 		t.Fatalf("messages len=%d %#v", len(msgs), msgs)
 	}
 	m0 := msgs[0].(map[string]any)
-	if m0["role"] != "system" || m0["content"] != "You are Codex" {
+	if m0["role"] != "system" || !strings.HasPrefix(m0["content"].(string), "You are Codex") || !strings.Contains(m0["content"].(string), "AUTONOMOUS AGENT MODE") {
 		t.Fatalf("system=%v", m0)
 	}
 	m1 := msgs[1].(map[string]any)
-	if m1["role"] != "user" || m1["content"] != "run ls" {
+	if m1["role"] != "user" || !strings.HasPrefix(m1["content"].(string), "run ls") || !strings.Contains(m1["content"].(string), "SYSTEM REMINDER") {
 		t.Fatalf("user=%v", m1)
 	}
 	m2 := msgs[2].(map[string]any)
@@ -1214,50 +1214,35 @@ func TestResponsesToolOutputImagesMoveToUserMessage(t *testing.T) {
 	}
 }
 
-func TestResponsesToChatDeepSeekInjectsAutonomousAgentRule(t *testing.T) {
-	wireWithTools := `{"model":"cn:deepseek-v4.1-flash","instructions":"system role instructions","tools":[{"type":"function","name":"exec_command"}],"input":"hi"}`
-	chatBytes, _, _, err := responsesToChat([]byte(wireWithTools))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var chat map[string]any
-	if err := json.Unmarshal(chatBytes, &chat); err != nil {
-		t.Fatal(err)
-	}
-	msgs := chat["messages"].([]any)
-	systemMsg := msgs[0].(map[string]any)
-	content := systemMsg["content"].(string)
-	if !strings.Contains(content, "system role instructions") {
-		t.Fatal("lost original instructions")
-	}
-	if !strings.Contains(content, "[CRITICAL EXECUTION RULE FOR AUTONOMOUS AGENT MODE]") {
-		t.Fatal("failed to inject autonomousAgentRule for DeepSeek with tools")
+func TestResponsesToChatTencentModelsInjectAutonomousAgentRule(t *testing.T) {
+	// 验证腾讯账号池下各类模型（DeepSeek、GLM、Kimi、MiniMax 等）在声明 tools 时均注入规则
+	for _, m := range []string{"cn:deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "glm-5.2", "kimi-k3", "minimax-m3"} {
+		wireWithTools := fmt.Sprintf(`{"model":%q,"instructions":"system role instructions","tools":[{"type":"function","name":"exec_command"}],"input":"hi"}`, m)
+		chatBytes, _, _, err := responsesToChat([]byte(wireWithTools))
+		if err != nil {
+			t.Fatalf("%s: %v", m, err)
+		}
+		var chat map[string]any
+		_ = json.Unmarshal(chatBytes, &chat)
+		content := chat["messages"].([]any)[0].(map[string]any)["content"].(string)
+		if !strings.Contains(content, "AUTONOMOUS AGENT MODE") {
+			t.Fatalf("failed to inject autonomousAgentRule for %s with tools", m)
+		}
 	}
 
-	// Without tools, it should not inject
-	wireNoTools := `{"model":"cn:deepseek-v4.1-flash","instructions":"system role instructions","input":"hi"}`
-	chatBytesNoTools, _, _, err := responsesToChat([]byte(wireNoTools))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var chatNoTools map[string]any
-	_ = json.Unmarshal(chatBytesNoTools, &chatNoTools)
-	contentNoTools := chatNoTools["messages"].([]any)[0].(map[string]any)["content"].(string)
-	if strings.Contains(contentNoTools, "AUTONOMOUS AGENT MODE") {
-		t.Fatal("injected rule when tools were absent")
-	}
-
-	// Non-DeepSeek model should not inject
-	wireNonDeepSeek := `{"model":"gpt-6.1-sol","instructions":"system role instructions","tools":[{"type":"function","name":"exec_command"}],"input":"hi"}`
-	chatBytesNonDS, _, _, err := responsesToChat([]byte(wireNonDeepSeek))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var chatNonDS map[string]any
-	_ = json.Unmarshal(chatBytesNonDS, &chatNonDS)
-	contentNonDS := chatNonDS["messages"].([]any)[0].(map[string]any)["content"].(string)
-	if strings.Contains(contentNonDS, "AUTONOMOUS AGENT MODE") {
-		t.Fatal("injected rule for non-DeepSeek model")
+	// 无 tools 时（纯文本问答），任何模型均不得注入规则
+	for _, m := range []string{"cn:deepseek-v4.1-flash", "glm-5.3-flash"} {
+		wireNoTools := fmt.Sprintf(`{"model":%q,"instructions":"system role instructions","input":"hi"}`, m)
+		chatBytesNoTools, _, _, err := responsesToChat([]byte(wireNoTools))
+		if err != nil {
+			t.Fatalf("%s: %v", m, err)
+		}
+		var chatNoTools map[string]any
+		_ = json.Unmarshal(chatBytesNoTools, &chatNoTools)
+		contentNoTools := chatNoTools["messages"].([]any)[0].(map[string]any)["content"].(string)
+		if strings.Contains(contentNoTools, "AUTONOMOUS AGENT MODE") {
+			t.Fatalf("injected rule when tools were absent for %s", m)
+		}
 	}
 }
 
