@@ -422,16 +422,23 @@ func stripToolCallNames(obj map[string]any, seen map[string]bool) {
 			} else if id, ok := tc["id"].(string); ok && id != "" {
 				key = "id:" + id
 			}
+			fn, _ := tc["function"].(map[string]any)
+			hasName := false
+			if fn != nil {
+				if n, _ := fn["name"].(string); strings.TrimSpace(n) != "" {
+					hasName = true
+				}
+			}
 			if seen[key] {
-				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := tc["function"].(map[string]any); fn != nil {
+				// 已发过带 name 的首片：删除本分片的 name 键（存在即删，幂等）。
+				if fn != nil {
 					delete(fn, "name")
 				}
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[key] = true
+			if hasName {
+				seen[key] = true
+			}
 		}
 	}
 }
@@ -867,7 +874,11 @@ readLoop:
 			// shortcut: 这一行就提交了响应头，首帧否决窗口随之关闭（首帧即注释的
 			// 形态罕见，不为此缓冲整段头部）。
 			headOpen = false
-			if _, werr := io.WriteString(w, line); werr != nil {
+			outLine := line
+			if strings.HasPrefix(trimmed, ":") && !strings.HasSuffix(line, "\n\n") {
+				outLine = trimmed + "\n\n"
+			}
+			if _, werr := io.WriteString(w, outLine); werr != nil {
 				return werr
 			}
 			if fl != nil {

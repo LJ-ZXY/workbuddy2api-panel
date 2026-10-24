@@ -853,10 +853,15 @@ func (w *messagesWriter) handleFrame(frame string) error {
 	if w.x.failed || w.x.done {
 		return nil
 	}
-	if strings.HasPrefix(frame, "data: [DONE]") {
+	if strings.HasPrefix(frame, "data: [DONE]") || strings.Contains(frame, "\ndata: [DONE]") {
 		return w.closeAndStop()
 	}
 	payload, ok := strings.CutPrefix(frame, "data: ")
+	if !ok {
+		if i := strings.Index(frame, "\ndata: "); i >= 0 {
+			payload, ok = frame[i+len("\ndata: "):], true
+		}
+	}
 	if !ok {
 		return nil
 	}

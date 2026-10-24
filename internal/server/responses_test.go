@@ -1335,3 +1335,32 @@ func TestResponsesDiagnosticsObserveWithoutChangingWire(t *testing.T) {
 		t.Fatal("first response time not recorded")
 	}
 }
+
+// 腾讯 CodeBuddy 上游首帧经常发送 : heartbeat 心跳注释行。
+// 必须保证心跳行不污染后续数据帧，工具名与调用不被静默丢弃（解决 Codex / Responses 中断问题）。
+func TestResponsesLeadingHeartbeatKeepsToolCalls(t *testing.T) {
+	raw := ": heartbeat\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\",\"name\":\"exec_command\"},\"id\":\"call_test\",\"index\":0,\"type\":\"function\"}]}}],\"id\":\"c1\",\"model\":\"glm-5.3\"}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"id\":\"c1\",\"model\":\"glm-5.3\"}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, raw, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	reqBody := `{"model":"glm-5.3","stream":true,"input":"run command","tools":[{"type":"function","name":"exec_command"}]}`
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(reqBody))
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	types := sseTypes(body)
+	if !containsStr(types, "response.output_item.added") {
+		t.Fatalf("心跳行导致首帧 tool_call 丢失！types=%v body=%s", types, body)
+	}
+	if !containsStr(types, "response.completed") {
+		t.Fatalf("缺失 response.completed: types=%v", types)
+	}
+	if !strings.Contains(body, "exec_command") {
+		t.Fatalf("出站未包含 exec_command 工具调用: %s", body)
+	}
+}

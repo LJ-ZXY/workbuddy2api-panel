@@ -664,3 +664,25 @@ func readDiagnostics(t *testing.T, dir string) []streamdiag.Metadata {
 	}
 	return out
 }
+
+// 腾讯 CodeBuddy 上游首帧发送 : heartbeat 时，Anthropic Messages 接口必须保留 tool_use。
+// 修复前首帧工具名被吞，导致 Claude Code 报 "The model's tool call could not be parsed"。
+func TestMessagesLeadingHeartbeatKeepsToolCalls(t *testing.T) {
+	raw := ": heartbeat\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\",\"name\":\"exec_command\"},\"id\":\"call_test\",\"index\":0,\"type\":\"function\"}]}}],\"id\":\"c1\",\"model\":\"glm-5.3\"}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"id\":\"c1\",\"model\":\"glm-5.3\"}\n\n" +
+		"data: [DONE]\n\n"
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, raw, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	reqBody := `{"model":"glm-5.3","stream":true,"max_tokens":1024,"messages":[{"role":"user","content":"run command"}],"tools":[{"name":"exec_command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}]}`
+	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(reqBody))
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "tool_use") || !strings.Contains(body, "exec_command") {
+		t.Fatalf("心跳行导致 Messages 接口丢失 tool_use: %s", body)
+	}
+}
