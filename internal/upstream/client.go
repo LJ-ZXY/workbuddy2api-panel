@@ -477,6 +477,30 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// parseQueueRetryAfter 从 6020/6021 排队响应的 body 抽上游明示的重试等待
+// （data.retry_after，整数秒）。上游把排队口径放在 body 而不是 Retry-After 头
+// （2026-10-28 真机：429 + code 6020，data 含 queue_position/queue_size/
+// retry_after/estimated_wait，头侧无任何等待信息），ParseRetryAfter（只认头）
+// 拿不到。只认结构化 data 字段——msg 是 i18n 键（queue.waiting.title）无数值
+// 可解析，requestId 等恰好含数字的字段不误伤。超过 retryAfterSanity 按异常值
+// 封顶（estimated_wait 是另一个字段，不会误入；防上游口径漂移时把天文数字带回）。
+// 解析不到返回 false，调用方回落本地兜底。
+func parseQueueRetryAfter(body []byte) (time.Duration, bool) {
+	var env struct {
+		Data struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.Data.RetryAfter <= 0 {
+		return 0, false
+	}
+	d := time.Duration(env.Data.RetryAfter) * time.Second
+	if d > retryAfterSanity {
+		d = retryAfterSanity
+	}
+	return d, true
+}
+
 // isAllDigits 报告 s 是否为纯数字（前置快筛，免 strconv 之后再判语义）。
 func isAllDigits(s string) bool {
 	if s == "" {
@@ -630,7 +654,8 @@ func Classify(status int, body string) ErrKind {
 	//（2026-10-15 实案：18 次全落 soft_rate，上游 PR #180/#185）。任意状态码都认
 	//（防上游换状态码）；结构化 code 主判，requestId 等字段恰好含 "6021" 不误伤
 	//（hasBusinessCode 只认 "code": 键）。
-	if hasBusinessCode(body, "6021") {
+	// 6020「queue.waiting.title」/ 6021「queue.full.title」渠道级排队/队列满：上游容量信号，不是账号限流。
+	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -1405,6 +1430,13 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
+			} else if kind == ErrUpstreamBusy {
+				// 6020 排队信封的等待口径在 body（data.retry_after），不在头
+				//（见 parseQueueRetryAfter 注释）。头解析拿不到时从 body 抽，
+				// 供 handler 末端 Retry-After 上报使用。
+				if d, ok := parseQueueRetryAfter(raw); ok {
+					ue.RetryAfter = d
+				}
 			}
 			return nil, resp.StatusCode, raw, ue
 		}

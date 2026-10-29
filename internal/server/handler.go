@@ -1126,23 +1126,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//（2026-10-15 实案：18 次全落 soft_rate），且换号把无效请求放大
 			// MaxRotate 倍。客户端按 SDK 退避重试即可；Retry-After 是本地兜底
 			//（上游未给重置口径时按 5s 提示，PR #180 同款）。
+			// 6020/6021 渠道级排队/容量满载：恢复请求内轮转，终态映射见末端 ErrUpstreamBusy 分支（429 + Retry-After）。
 			if kind == upstream.ErrUpstreamBusy {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
-				msg := string(respBody)
-				if strings.TrimSpace(msg) == "" {
-					msg = "upstream capacity is full (queue.full); retry after a short wait"
+				retryAfter := time.Duration(0)
+				if uerr != nil {
+					retryAfter = uerr.RetryAfter
 				}
-				retryAfter := "5"
-				if uerr != nil && uerr.RetryAfter > 0 && int64(uerr.RetryAfter.Seconds()) > 0 {
-					retryAfter = strconv.FormatInt(int64(uerr.RetryAfter.Seconds()), 10)
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: retryAfter}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转（排队满载换号退避）
 				}
-				w.Header().Set("Retry-After", retryAfter)
-				writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "upstream_busy", msg,
-					h.hintOf(upstream.ErrUpstreamBusy, string(respBody), bareModel, reqHasImage, uerr))
-				st.status = http.StatusServiceUnavailable
-				st.outcome = reqlog.OutcomeHTTPError
-				return
+				continue
 			}
 			// 11148「tool calls and tool results do not match」：请求内容级配对断裂。
 			// 上游明示「直接重试无效，请新建任务」——同一 body 换任何账号都撞同一处，
@@ -1424,12 +1420,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
 		case upstream.ErrUpstreamBusy:
-			// 6021 渠道级容量满载（防御路径：正常已在轮转循环内 fail-fast，本分支
-			// 只在异常流经末端时兜底）。503 + 可重试语义，上游原文（下方统一透传）
-			// 含 requestId。
-			status = http.StatusServiceUnavailable
+			// 6020/6021 渠道级排队/容量满载：轮转已耗尽（本请求每个号都撞同一堵墙）。
+			// 回 429 + Retry-After（上游 data.retry_after，缺省 5s，封顶 maxRetryAfterSec）而不是 503。
+			status = http.StatusTooManyRequests
 			code = "upstream_busy"
-			msg = "upstream capacity is full (queue.full); retry after a short wait"
+			msg = "upstream queue is full; retry after a short wait"
+			if ue.RetryAfter > 0 {
+				if secs := int(math.Ceil(ue.RetryAfter.Seconds())); secs > 0 {
+					retryAfterSec = secs
+					if retryAfterSec > maxRetryAfterSec {
+						retryAfterSec = maxRetryAfterSec
+					}
+				}
+			}
+			if retryAfterSec == 0 {
+				retryAfterSec = 5 // 上游未给口径时的本地兜底
+			}
 		case upstream.ErrHardCredit:
 			// 14018/402：积分耗尽。429 + insufficient_quota，message 优先上游
 			// 原文（含购买链接；下方统一覆盖）。
@@ -1535,6 +1541,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // hardCreditMessage 池内无号可试、原因全是积分耗尽时的自有文案（无上游原文可
 // 透传的场合；与 gateway_hint 并列，不重复 hint 的「等签到恢复」指向）。
+// maxRetryAfterSec Retry-After 上报上限（秒，10 分钟）。
+const maxRetryAfterSec = 600
+
 const hardCreditMessage = "all accounts have exhausted upstream credits; retry after credits are restored (daily check-in or add-on packs)"
 
 // modelBlockIsTransient 判断模型级冷却的原因是「暂时忙/被限流」还是「确定性拒绝」。
