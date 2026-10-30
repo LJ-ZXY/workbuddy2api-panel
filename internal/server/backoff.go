@@ -101,6 +101,23 @@ func waitPast(d time.Duration) time.Duration {
 	return d + time.Duration(float64(d)*rand.Float64()*jitterFraction)
 }
 
+// waitForSlot 在「号都在途占满」时等一个空名额：轮询 slotPoll，上限 busyWaitCap
+func waitForSlot(ctx context.Context, p *pool.Pool, model, realm string) bool {
+	deadline := time.Now().Add(busyWaitCap)
+	for time.Now().Before(deadline) {
+		if !sleepCtx(ctx, slotPoll) {
+			return false
+		}
+		if !p.SlotWaitForRealm(model, realm) {
+			return true
+		}
+	}
+	return true
+}
+
+// slotPoll 等在途名额的轮询间隔
+const slotPoll = 50 * time.Millisecond
+
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil

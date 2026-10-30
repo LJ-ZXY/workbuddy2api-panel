@@ -11,6 +11,18 @@ import (
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
+// SplitRealmPrefix 解析网关的 realm 前缀协议（"[realm:]model"）：
+// 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm 回落 "cn"。
+func SplitRealmPrefix(model string) (realm, bare string) {
+	if i := strings.IndexByte(model, ':'); i >= 0 {
+		switch model[:i] {
+		case "cn", "global":
+			return model[:i], model[i+1:]
+		}
+	}
+	return "cn", model
+}
+
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
 }

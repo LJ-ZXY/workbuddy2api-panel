@@ -218,6 +218,10 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 // 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
 // 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
+	if model == "" {
+		p.CooldownSoftRate(uid, base, resetAt, reason)
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -245,6 +249,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			clearRoutingModelCooldownsLocked(e)
 		} else {
 			// 无解析时间：把 **(号, 模型)** 停车，而不是整号冷却。
+			if old, ok := e.modelCooldowns[model]; ok && !old.AuditOnly && old.Until.After(now) {
+				return // 并发失败不能延长正在生效的模型冷却。
+			}
 			//
 			// 为什么必须模型级：6004/14003 的语义都是「这个模型忙/额度紧」，上游文案就是让
 			// 客户端换模型，实测同号换模型立刻可用。按账号冷却是把「一个模型抖动」放大成
@@ -410,9 +417,12 @@ func (p *Pool) BlockModelClear(uid, model string) {
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
 	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
-	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）；取最早解封的那条
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Reasons 每个被挡账号的锁因（与 Count 等长）。Reason 只有一条，分不清「全池
+	// 是不是同一个原因」；调用方按需聚合（如「是不是清一色用量配额 6004」）。
+	Reasons []string
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。（吸收上游 44d6e04）
@@ -462,14 +472,17 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		}
 		st.Count++
 		if mc, ok := e.modelCooldowns[model]; ok {
-			if st.Reason == "" {
-				st.Reason = mc.Reason
-			}
-			// 取最早解封：那才是"再等多久值得重试"的答案。
+			st.Reasons = append(st.Reasons, mc.Reason)
+			// 取最早解封：那才是"再等多久值得重试"的答案。Reason 跟着这条走，
+			// 保证「原因」与「解锁时刻」出自同一个账号，不会张冠李戴。
 			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
 				st.Until = mc.Until
+				st.Reason = mc.Reason
 			}
 		}
+	}
+	if st.Reason == "" && len(st.Reasons) > 0 {
+		st.Reason = st.Reasons[0]
 	}
 	if st.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。

@@ -719,6 +719,26 @@ func (p *Pool) ServableNow() bool {
 // ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
 // 与 ServableNow 同口径（healthy 或模型豁免、排除 inFlightFull），仅叠加 Realm()==realm 谓词。
 // realm=="" 退化为 ServableNow（现状语义）。供 /healthz 按 realm 暴露 CN/global 各自可达性。
+// SlotWaitForRealm 报告「此刻选不到号**只是**因为号都在途占满」：本域存在对该模型
+// 健康（未冷却/未停牌/未手动关闭）的账号，只是名额已满。
+func (p *Pool) SlotWaitForRealm(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) && !p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -887,7 +907,7 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		mc := e.modelCooldowns[m]
 		if !mc.Until.IsZero() && now.Before(mc.Until) {
 			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
+			if strings.HasPrefix(mc.Reason, "11102") || strings.HasPrefix(mc.Reason, "11158") {
 				kind = "model_unavailable"
 			}
 			row := RateLimitedModel{

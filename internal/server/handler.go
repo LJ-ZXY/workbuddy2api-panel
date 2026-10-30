@@ -734,6 +734,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
 	busyWaited := false
+	slotWaited := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -963,6 +964,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
+			}
+			// issue #117：全池该模型没号，但原因不是冷却而是**在途占满**时，等一个名额再试一次。
+			if !slotWaited && h.cfg.Pool.SlotWaitForRealm(bareModel, realm) {
+				slotWaited = true
+				log.Printf("slot-wait: model=%s realm=%q all healthy accounts at in-flight cap, waiting up to %s then retry once (issue #117)",
+					bareModel, realm, busyWaitCap)
+				if !waitForSlot(r.Context(), h.cfg.Pool, bareModel, realm) {
+					break // 客户端已断连：不必再等
+				}
+				i-- // 等待不算一次换号：槽位留给真正的尝试
+				continue
 			}
 			st.status = http.StatusServiceUnavailable
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
@@ -1396,6 +1408,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// quota：积分耗尽专用形态（429 + type/code 同为 insufficient_quota，OpenAI
 	// 自己的 quota 错误口径；客户端据此不重试）。
 	quota := false
+	quotaCode := 0
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint := upstream.NoHealthyAccountHint()
@@ -1479,6 +1492,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		status, quota = http.StatusTooManyRequests, true
 		msg = hardCreditMessage
 		hint = upstream.GatewayHint(upstream.ErrHardCredit, "", upstream.HintContext{})
+	} else if ue == nil && modelBlockAllQuota(modelBlock) {
+		status, quotaCode = http.StatusTooManyRequests, modelQuotaCode(modelBlock.Reason)
+		msg = "model usage limit reached on every account; retry after the quota window resets"
+		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+			msg = s // 上游原文（含 code 6004 / 重置时刻 / requestId）
+		}
+		hint = fmt.Sprintf("model_quota: %d account(s) hit this model's usage limit", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			hint += "; resets at " + modelBlock.Until.Format(time.RFC3339)
+		}
+	} else if modelBlockAllSoftRate(modelBlock) {
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+		msg = "this model is rate limited on every account; wait for cooldown or choose another model"
+		hint = fmt.Sprintf("model_rate_limit: %d account(s) cooling down this model", modelBlock.Count)
+		if !modelBlock.Until.IsZero() {
+			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
+		}
 	} else if modelBlock.Blocked && modelBlockIsTransient(modelBlock.Reason) {
 		// 全池该模型只是「忙 / 被上游限流」（14003 model busy、6004 rate limit），
 		// 不是「这个模型不存在或这个号型不允许」——上游对这两种的处置完全不同：
@@ -1499,6 +1530,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if d := time.Until(modelBlock.Until); d > 0 {
 				secs := int(math.Ceil(d.Seconds()))
 				retryAfterSec = secs
+				if retryAfterSec > maxRetryAfterSec {
+					retryAfterSec = maxRetryAfterSec
+				}
 				hint += fmt.Sprintf("; earliest unblock in %ds", secs)
 			}
 		}
@@ -1524,9 +1558,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if retryAfterSec > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSec))
 	}
-	if quota {
+	switch {
+	case quotaCode != 0:
+		writeModelQuotaError(w, quotaCode, msg, hint)
+	case quota:
 		writeOpenAIQuotaError(w, msg, hint)
-	} else {
+	default:
 		writeOpenAIErrorHint(w, status, code, msg, hint)
 	}
 	st.status = status
@@ -1568,6 +1605,39 @@ func modelBlockIsTransient(reason string) bool {
 	return false
 }
 
+// modelBlockAllSoftRate 将普通模型限流与模型不存在、无权限和瞬时繁忙区分。
+func modelBlockAllSoftRate(blk pool.ModelBlockStatus) bool {
+	if !blk.Blocked || len(blk.Reasons) == 0 {
+		return false
+	}
+	for _, reason := range blk.Reasons {
+		if !strings.HasPrefix(reason, "429 model rate limit") &&
+			(!upstream.IsModelRateLimit(reason) || upstream.IsModelBusy(reason)) {
+			return false
+		}
+	}
+	return true
+}
+
+// modelBlockAllQuota 报告「全池该模型被挡」是否清一色是「用量配额」型：上游 6004/6000
+func modelBlockAllQuota(blk pool.ModelBlockStatus) bool {
+	if !blk.Blocked || len(blk.Reasons) == 0 {
+		return false
+	}
+	for _, r := range blk.Reasons {
+		if !upstream.IsModelRateLimit(r) || upstream.IsModelBusy(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func modelQuotaCode(reason string) int {
+	if upstream.HasCodeMarker(reason, "6000") {
+		return 6000
+	}
+	return 6004
+}
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。（吸收上游 8b18ab8）
 //
 // 分母用「生成耗时」= 端到端耗时 - 首 token 等待（TTFB），不是端到端耗时。
@@ -1682,8 +1752,7 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //
 // 十条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
+//   - ErrSoftRate → 聊天限流均按模型隔离；优先对齐上游重置墙钟，无时间才走有界退避。冷却时长优先采信
 //     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
@@ -1717,19 +1786,25 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
+		// 聊天限流按账号+模型隔离，无模型上下文时仍由池退回账号级冷却。
+		_, model = upstream.SplitRealmPrefix(model)
 		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，就精确冷却到该墙钟、绝不
 		// 指数堆加。
 		//   - 模型级（6004 / 14003）→ CooldownSoftForModel：写 modelCooldowns[model]，
 		//     切模型豁免。**无论有没有解析时间都走这条**——模型忙不是账号坏，按账号冷却
 		//     会把一个模型的抖动放大成整池停摆（实测同号换模型立刻可用）。
-		//   - 账号级（其余 429 文案）→ CooldownSoftRate：写账号级 until。
+		// 其余普通 429 同样只停当前模型，不扩大为整号冷却。
 		modelRateLimited := upstream.IsModelRateLimit(body)
+		modelReason := "model rate limit"
+		if s := strings.TrimSpace(body); s != "" {
+			modelReason = s
+		}
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, modelReason)
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "429 model rate limit: "+body)
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
@@ -1742,21 +1817,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			// 14003 是「模型繁忙」：没有恢复时刻，上游文案就是让客户端换模型/稍后
 			// 重试，不是这个号被限流。给独立短窗口（10s 起、封顶 1m），不套 soft_rate
 			// 的 600s→2h 阶梯，否则一次抖动就是十分钟不可用。
-			if retryAfter.IsZero() && upstream.IsModelBusy(body) {
+			if model != "" && retryAfter.IsZero() && upstream.IsModelBusy(body) {
 				h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
 				return
 			}
-			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, "model rate limit")
+			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, modelReason)
 			return
 		}
-		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
-		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
-		// （热改优先），管理面板改 soft_rate 后立即生效。
-		reason := "429 rate limit"
+		// 无重置时间时使用模型级有界退避；重复失败不延长当前冷却。
+		reason := "429 model rate limit: " + body
 		if !retryAfter.IsZero() {
-			reason = "429 rate limit (retry-after)"
+			reason += " (retry-after)"
 		}
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), retryAfter, reason)
+		h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), retryAfter, model, reason)
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
 		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
@@ -1907,6 +1980,18 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 // writeOpenAIQuotaError 积分耗尽专用响应：429 + type/code 同为 insufficient_quota
 // （OpenAI 自身 quota 错误的字段口径，客户端按 type 或 code 任一即可识别「不是限流、
 // 重试无意义」）。message 照旧装上游原文或自有文案。
+func writeModelQuotaError(w http.ResponseWriter, code int, msg, hint string) {
+	e := map[string]any{
+		"message": msg,
+		"type":    "insufficient_quota",
+		"code":    code,
+	}
+	if hint != "" {
+		e["gateway_hint"] = hint
+	}
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{"error": e})
+}
+
 func writeOpenAIQuotaError(w http.ResponseWriter, msg, hint string) {
 	e := map[string]any{
 		"message": msg,
