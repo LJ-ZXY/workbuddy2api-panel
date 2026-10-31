@@ -1096,6 +1096,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">成本探索窗口</span>
                 <input name="cost_explore_interval" placeholder="30m">
                 <span class="hint">垄断破除：免费层垄断时定期搭车探索未知号；0 关停</span></label>
+              <label class="fld"><span class="lb">用量均衡窗口</span>
+                <input name="balance_window" placeholder="1h">
+                <span class="hint">按账号在该模型窗口内的 token 用量反比降权，把热点号打散；0 关停</span></label>
               <label class="fld"><span class="lb">积分保底</span>
                 <input name="credit_floor" type="number" min="0" placeholder="100">
                 <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
